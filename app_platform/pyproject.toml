@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "app-platform"
+version = "0.2.0"
+description = "Generic web app infrastructure: PostgreSQL pooling, structured logging, rate limiting, FastAPI middleware, auth service, gateway proxy"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Henry Chien" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3 :: Only",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "psycopg2-binary>=2.9",
+]
+
+[project.optional-dependencies]
+fastapi = [
+    "fastapi>=0.100",
+    "starlette",
+    "slowapi>=0.1.9",
+    "itsdangerous>=2.0",
+]
+auth-google = [
+    "google-auth>=2.0",
+    "requests>=2.20",
+]
+gateway = [
+    "httpx>=0.24",
+    "fastapi>=0.100",
+]
+all = ["app-platform[fastapi,auth-google,gateway]"]
+
+[project.urls]
+Homepage = "https://github.com/henrysouchien/app-platform"
+Repository = "https://github.com/henrysouchien/app-platform"
+
+[tool.hatchling.build]
+packages = ["app_platform"]

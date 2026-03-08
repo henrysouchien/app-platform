@@ -1,0 +1,45 @@
+"""Structured logging exports for app_platform."""
+
+from .core import (
+    APP_LOG_FORMAT,
+    DEDUP_WINDOW_S,
+    JSON_LOG_FORMAT,
+    MAX_DEDUP_KEYS,
+    SLOW_OPERATION_THRESHOLD,
+    VERY_SLOW_OPERATION_THRESHOLD,
+    LoggingManager,
+    clear_log_context,
+    configure_logging,
+    get_logger,
+    get_logging_manager,
+    log_alert,
+    log_error,
+    log_event,
+    log_service_status,
+    log_slow_operation,
+    set_log_context,
+)
+from .decorators import log_errors, log_operation, log_timing
+
+__all__ = [
+    "APP_LOG_FORMAT",
+    "DEDUP_WINDOW_S",
+    "JSON_LOG_FORMAT",
+    "MAX_DEDUP_KEYS",
+    "SLOW_OPERATION_THRESHOLD",
+    "VERY_SLOW_OPERATION_THRESHOLD",
+    "LoggingManager",
+    "clear_log_context",
+    "configure_logging",
+    "get_logger",
+    "get_logging_manager",
+    "log_alert",
+    "log_error",
+    "log_errors",
+    "log_event",
+    "log_operation",
+    "log_service_status",
+    "log_slow_operation",
+    "log_timing",
+    "set_log_context",
+]
