@@ -4,7 +4,7 @@ import os
 import threading
 
 import psycopg2.extras
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 
 
 class PoolManager:
@@ -60,7 +60,7 @@ class PoolManager:
                             "DB_POOL_MIN cannot be greater than DB_POOL_MAX"
                         )
 
-                    self._pool = SimpleConnectionPool(
+                    self._pool = ThreadedConnectionPool(
                         min_connections,
                         max_connections,
                         database_url,

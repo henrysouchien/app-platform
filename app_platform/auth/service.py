@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, Optional
@@ -10,6 +11,8 @@ from app_platform.db.exceptions import AuthenticationError
 
 from .protocols import SessionStore, TokenVerifier, UserStore
 from .stores import InMemoryUserStore
+
+logger = logging.getLogger(__name__)
 
 
 class AuthServiceBase:
@@ -116,6 +119,11 @@ class AuthServiceBase:
                 return None
 
             except Exception as exc:
+                logger.warning(
+                    "Primary session lookup failed for session_id=%s...: %s",
+                    session_id[:8],
+                    exc,
+                )
                 if self.strict_mode:
                     raise AuthenticationError(
                         f"Primary session lookup failed: {exc}",
@@ -126,7 +134,12 @@ class AuthServiceBase:
 
             return self.fallback_session_store.get_session(session_id)
 
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Session lookup failed (outer) for session_id=%s...: %s",
+                session_id[:8],
+                exc,
+            )
             return None
 
     def delete_session(self, session_id: str) -> bool:
