@@ -10,6 +10,7 @@ from .cors import DEFAULT_HEADERS, DEFAULT_METHODS, configure_cors
 from .error_handlers import add_rate_limit_handler, add_validation_error_handler
 from .rate_limiter import ApiKeyRegistry, RateLimitConfig, create_limiter
 from .sessions import DEFAULT_SESSION_SECRET, configure_sessions, resolve_session_secret
+from .timing import RequestTimingMiddleware
 
 
 @dataclass
@@ -43,6 +44,8 @@ def configure_middleware(app, config: MiddlewareConfig | None = None):
             and not getattr(config.rate_limiter, "enabled", True)
         ),
     )
+    # Added last so it wraps outermost.
+    app.add_middleware(RequestTimingMiddleware)
     return app
 
 
@@ -53,6 +56,7 @@ __all__ = [
     "DEFAULT_SESSION_SECRET",
     "MiddlewareConfig",
     "RateLimitConfig",
+    "RequestTimingMiddleware",
     "add_rate_limit_handler",
     "add_validation_error_handler",
     "configure_cors",

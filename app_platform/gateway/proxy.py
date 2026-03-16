@@ -78,10 +78,13 @@ def _get_user_key(user: dict[str, Any]) -> str:
 def _build_gateway_chat_payload(
     chat_request: GatewayChatRequest,
     channel: str,
+    user_key: str | None = None,
 ) -> dict[str, Any]:
-    """Build upstream chat payload with enforced channel and no model field."""
+    """Build upstream chat payload with enforced channel/user_id and no model field."""
 
     upstream_context = {**(chat_request.context or {}), "channel": channel}
+    if user_key is not None:
+        upstream_context["user_id"] = user_key
     return {
         "messages": chat_request.messages,
         "context": upstream_context,
@@ -149,7 +152,7 @@ def create_gateway_router(
                 lock_released = True
 
         try:
-            upstream_payload = _build_gateway_chat_payload(chat_request, config.channel)
+            upstream_payload = _build_gateway_chat_payload(chat_request, config.channel, user_key)
             session_token = await session_manager.get_token(
                 user_key=user_key,
                 client=client,

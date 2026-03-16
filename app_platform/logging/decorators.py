@@ -23,7 +23,7 @@ def log_errors(severity: str = "medium"):
                 except Exception as exc:  # pragma: no cover - exercised by tests
                     log_error(
                         source=f"{func.__module__}:{func.__name__}",
-                        message=f"Function {func.__name__} failed",
+                        message=f"{func.__name__} failed: {type(exc).__name__}: {exc}",
                         exc=exc,
                         severity=severity,
                     )
@@ -38,7 +38,7 @@ def log_errors(severity: str = "medium"):
             except Exception as exc:
                 log_error(
                     source=f"{func.__module__}:{func.__name__}",
-                    message=f"Function {func.__name__} failed",
+                    message=f"{func.__name__} failed: {type(exc).__name__}: {exc}",
                     exc=exc,
                     severity=severity,
                 )
@@ -49,8 +49,12 @@ def log_errors(severity: str = "medium"):
     return decorator
 
 
-def log_timing(threshold_s: float | None = None):
-    """Decorator: measure function duration and log only above threshold."""
+def log_timing(threshold_s: float | None = None, *, always_record: bool = False):
+    """Decorator: measure function duration.
+
+    When always_record=True, every call writes to timing.jsonl.
+    Threshold controls app.log warning only.
+    """
 
     def decorator(func: Callable) -> Callable:
         if asyncio.iscoroutinefunction(func):
@@ -62,6 +66,17 @@ def log_timing(threshold_s: float | None = None):
                     return await func(*args, **kwargs)
                 finally:
                     duration_s = time.perf_counter() - start
+                    duration_ms = duration_s * 1000
+
+                    if always_record:
+                        from .core import log_timing_event
+
+                        log_timing_event(
+                            kind="step",
+                            name=f"{func.__module__}.{func.__name__}",
+                            duration_ms=duration_ms,
+                        )
+
                     manager = get_logging_manager()
                     assert manager is not None
                     threshold = (
@@ -84,6 +99,17 @@ def log_timing(threshold_s: float | None = None):
                 return func(*args, **kwargs)
             finally:
                 duration_s = time.perf_counter() - start
+                duration_ms = duration_s * 1000
+
+                if always_record:
+                    from .core import log_timing_event
+
+                    log_timing_event(
+                        kind="step",
+                        name=f"{func.__module__}.{func.__name__}",
+                        duration_ms=duration_ms,
+                    )
+
                 manager = get_logging_manager()
                 assert manager is not None
                 threshold = (

@@ -226,10 +226,12 @@ class LoggingManager:
         self.errors_log_path = os.path.join(self.log_dir, "errors.jsonl")
         self.usage_log_path = os.path.join(self.log_dir, "usage.jsonl")
         self.frontend_log_path = os.path.join(self.log_dir, "frontend.jsonl")
+        self.timing_log_path = os.path.join(self.log_dir, "timing.jsonl")
 
         self.errors_logger_name = f"{self.app_name}.errors_json"
         self.usage_logger_name = f"{self.app_name}.usage_json"
         self.frontend_logger_name = f"{self.app_name}.frontend_json"
+        self.timing_logger_name = f"{self.app_name}.timing_json"
 
         self._managed_handlers: list[tuple[logging.Logger, logging.Handler]] = []
         self._dedup_lock = threading.Lock()
@@ -257,6 +259,13 @@ class LoggingManager:
             self.frontend_log_path,
             rotating=True,
             max_bytes=5 * 1024 * 1024,
+            backup_count=5,
+        )
+        self.timing_event_logger = self._create_json_logger(
+            self.timing_logger_name,
+            self.timing_log_path,
+            rotating=True,
+            max_bytes=50 * 1024 * 1024,
             backup_count=5,
         )
 
@@ -644,6 +653,30 @@ def log_service_status(service: str, status: str, **details: Any) -> dict[str, A
     return manager.log_service_status(service, status, **details)
 
 
+def log_timing_event(
+    kind: str,
+    name: str,
+    duration_ms: float,
+    *,
+    status: int | None = None,
+    **details: Any,
+) -> None:
+    """Write a structured timing event to timing.jsonl."""
+    manager = LoggingManager._get_default_manager()
+    assert manager is not None
+    record = {
+        "ts": _now_iso(),
+        "kind": kind,
+        "name": name,
+        "duration_ms": round(duration_ms, 2),
+    }
+    if status is not None:
+        record["status"] = status
+    if details:
+        record["details"] = _normalize_details(details)
+    _emit_json(manager.timing_event_logger, record)
+
+
 __all__ = [
     "APP_LOG_FORMAT",
     "JSON_LOG_FORMAT",
@@ -661,5 +694,6 @@ __all__ = [
     "log_event",
     "log_service_status",
     "log_slow_operation",
+    "log_timing_event",
     "set_log_context",
 ]

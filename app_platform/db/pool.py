@@ -35,14 +35,14 @@ class PoolManager:
     def min_connections(self):
         value = self._min_connections
         if value is None:
-            value = os.getenv("DB_POOL_MIN", "5")
+            value = os.getenv("DB_POOL_MIN", "2")
         return int(value)
 
     @property
     def max_connections(self):
         value = self._max_connections
         if value is None:
-            value = os.getenv("DB_POOL_MAX", "20")
+            value = os.getenv("DB_POOL_MAX", "10")
         return int(value)
 
     def get_pool(self):
@@ -96,4 +96,14 @@ def get_pool():
     return PoolManager._get_default_manager().get_pool()
 
 
-__all__ = ["PoolManager", "get_pool"]
+def close_pool() -> None:
+    """Close the process-global connection pool, if it exists."""
+
+    with PoolManager._default_lock:
+        manager = PoolManager._default_manager
+        if manager is not None:
+            manager.close()
+            PoolManager._default_manager = None
+
+
+__all__ = ["PoolManager", "close_pool", "get_pool"]

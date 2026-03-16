@@ -121,8 +121,7 @@ class AuthServiceBase:
             except Exception as exc:
                 logger.warning(
                     "Primary session lookup failed for session_id=%s...: %s",
-                    session_id[:8],
-                    exc,
+                    session_id[:8], exc,
                 )
                 if self.strict_mode:
                     raise AuthenticationError(
@@ -137,8 +136,7 @@ class AuthServiceBase:
         except Exception as exc:
             logger.warning(
                 "Session lookup failed (outer) for session_id=%s...: %s",
-                session_id[:8],
-                exc,
+                session_id[:8], exc,
             )
             return None
 

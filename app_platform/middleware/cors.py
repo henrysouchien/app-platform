@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from fastapi.middleware.cors import CORSMiddleware
 
-DEFAULT_METHODS = ["*"]
-DEFAULT_HEADERS = ["*"]
+DEFAULT_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+DEFAULT_HEADERS = [
+    "Content-Type",
+    "Authorization",
+    "X-API-Key",
+    "X-Admin-Token",
+    "X-Requested-With",
+    "Accept",
+    "Origin",
+]
 
 
 def configure_cors(

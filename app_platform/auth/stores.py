@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+_TOUCH_INTERVAL = timedelta(minutes=5)
 
 
 class PostgresSessionStore:
@@ -34,7 +37,7 @@ class PostgresSessionStore:
             now = _utcnow()
             cursor.execute(
                 """
-                SELECT s.session_id, s.user_id, s.expires_at,
+                SELECT s.session_id, s.user_id, s.expires_at, s.last_accessed,
                        u.email, u.name, u.tier, u.google_user_id
                 FROM user_sessions s
                 JOIN users u ON s.user_id = u.id
@@ -46,15 +49,23 @@ class PostgresSessionStore:
             if not result:
                 return None
 
-            cursor.execute(
-                """
-                UPDATE user_sessions
-                SET last_accessed = %s
-                WHERE session_id = %s
-                """,
-                (now, session_id),
-            )
-            conn.commit()
+            last_accessed = result["last_accessed"]
+            # Normalize both to naive UTC for safe comparison (DB may return
+            # naive or aware depending on driver/test setup).
+            now_cmp = now.replace(tzinfo=None)
+            if last_accessed is not None and last_accessed.tzinfo is not None:
+                last_accessed = last_accessed.replace(tzinfo=None)
+            if last_accessed is None or (now_cmp - last_accessed) > _TOUCH_INTERVAL:
+                cursor.execute(
+                    """
+                    UPDATE user_sessions
+                    SET last_accessed = %s
+                    WHERE session_id = %s
+                    """,
+                    (now, session_id),
+                )
+                conn.commit()
+
             return {
                 "user_id": result["user_id"],
                 "google_user_id": result["google_user_id"],

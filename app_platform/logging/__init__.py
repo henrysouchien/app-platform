@@ -17,6 +17,7 @@ from .core import (
     log_event,
     log_service_status,
     log_slow_operation,
+    log_timing_event,
     set_log_context,
 )
 from .decorators import log_errors, log_operation, log_timing
@@ -40,6 +41,7 @@ __all__ = [
     "log_operation",
     "log_service_status",
     "log_slow_operation",
+    "log_timing_event",
     "log_timing",
     "set_log_context",
 ]

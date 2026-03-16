@@ -92,7 +92,7 @@ def _build_key_func(dev_mode: bool, key_registry: ApiKeyRegistry):
         if request is None:
             return "127.0.0.1"
 
-        user_key = request.query_params.get("key", public_key)
+        user_key = request.headers.get("X-API-Key") or request.query_params.get("key", public_key)
         user_tier = tier_map.get(user_key, "public")
         if user_tier == "public":
             return get_remote_address(request)
