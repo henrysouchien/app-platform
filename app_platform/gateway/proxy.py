@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -10,8 +11,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from app_platform.auth.dependencies import TIER_ORDER
 from .models import GatewayChatRequest, GatewayToolApprovalRequest
 from .session import GatewaySessionManager
+
+logger = logging.getLogger(__name__)
+_RESERVED_HEADERS = frozenset({"authorization"})
 
 
 @dataclass
@@ -22,6 +27,7 @@ class GatewayConfig:
     api_key: str | Callable[[], str] = ""
     ssl_verify: bool | str | Callable[[], bool | str] = True
     channel: str = "web"
+    request_headers_factory: Callable[[Any], dict[str, str]] | None = None
 
     def resolve_url(self) -> str:
         raw_url = self.gateway_url() if callable(self.gateway_url) else self.gateway_url
@@ -96,11 +102,18 @@ async def _open_gateway_chat_stream(
     gateway_url: str,
     session_token: str,
     payload: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
 ) -> httpx.Response:
+    headers: dict[str, str] = {}
+    if extra_headers:
+        headers.update(
+            {key: value for key, value in extra_headers.items() if key.lower() not in _RESERVED_HEADERS}
+        )
+    headers["Authorization"] = f"Bearer {session_token}"
     request = client.build_request(
         "POST",
         f"{gateway_url}/api/chat",
-        headers={"Authorization": f"Bearer {session_token}"},
+        headers=headers,
         json=payload,
     )
     return await client.send(request, stream=True)
@@ -132,6 +145,19 @@ def create_gateway_router(
     ):
         """Proxy web-channel chat stream to the gateway."""
 
+        purpose = str((chat_request.context or {}).get("purpose") or "chat").strip().lower() or "chat"
+        user_tier = str(user.get("tier") or "registered").strip().lower() or "registered"
+        if purpose != "normalizer" and TIER_ORDER.get(user_tier, 0) < TIER_ORDER["paid"]:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "upgrade_required",
+                    "message": "AI chat requires a paid subscription.",
+                    "tier_required": "paid",
+                    "tier_current": user_tier,
+                },
+            )
+
         user_key = _get_user_key(user)
         user_lock = await session_manager.get_stream_lock(user_key)
         if user_lock.locked():
@@ -153,6 +179,12 @@ def create_gateway_router(
 
         try:
             upstream_payload = _build_gateway_chat_payload(chat_request, config.channel, user_key)
+            extra_headers = None
+            if config.request_headers_factory is not None:
+                try:
+                    extra_headers = config.request_headers_factory(request)
+                except Exception:
+                    logger.warning("request_headers_factory raised; skipping extra headers", exc_info=True)
             session_token = await session_manager.get_token(
                 user_key=user_key,
                 client=client,
@@ -166,6 +198,7 @@ def create_gateway_router(
                 gateway_url=gateway_url,
                 session_token=session_token,
                 payload=upstream_payload,
+                extra_headers=extra_headers,
             )
 
             if upstream_response.status_code == 401:
@@ -183,6 +216,7 @@ def create_gateway_router(
                     gateway_url=gateway_url,
                     session_token=session_token,
                     payload=upstream_payload,
+                    extra_headers=extra_headers,
                 )
 
             if upstream_response.status_code != 200:
@@ -196,17 +230,39 @@ def create_gateway_router(
                 )
 
             async def event_stream():
+                _disconnected = False
+
+                async def _watch_disconnect() -> None:
+                    nonlocal _disconnected
+
+                    while True:
+                        await asyncio.sleep(2)
+                        if await request.is_disconnected():
+                            _disconnected = True
+                            try:
+                                await asyncio.shield(upstream_response.aclose())
+                            except Exception:
+                                pass
+                            return
+
+                disconnect_task = asyncio.create_task(_watch_disconnect())
                 try:
                     assert upstream_response is not None
                     async for chunk in upstream_response.aiter_raw():
-                        if await request.is_disconnected():
-                            break
                         if chunk:
                             yield chunk
-                except asyncio.CancelledError:
-                    raise
+                except Exception:
+                    if not _disconnected:
+                        raise
                 finally:
+                    disconnect_task.cancel()
+                    try:
+                        await disconnect_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     await release_resources()
+                    if _disconnected:
+                        session_manager.invalidate_token(user_key)
 
             return StreamingResponse(
                 event_stream(),

@@ -49,6 +49,11 @@ class GatewaySessionManager:
                 self._stream_locks[user_key] = lock
             return lock
 
+    def invalidate_token(self, user_key: str) -> None:
+        """Drop any cached gateway session token for the user."""
+
+        self._tokens.pop(user_key, None)
+
     def reset(self) -> None:
         """Reset in-memory state without replacing dict objects."""
 

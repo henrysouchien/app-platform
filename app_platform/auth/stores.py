@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-_TOUCH_INTERVAL = timedelta(minutes=5)
 
 
 class PostgresSessionStore:
@@ -48,23 +45,6 @@ class PostgresSessionStore:
             result = cursor.fetchone()
             if not result:
                 return None
-
-            last_accessed = result["last_accessed"]
-            # Normalize both to naive UTC for safe comparison (DB may return
-            # naive or aware depending on driver/test setup).
-            now_cmp = now.replace(tzinfo=None)
-            if last_accessed is not None and last_accessed.tzinfo is not None:
-                last_accessed = last_accessed.replace(tzinfo=None)
-            if last_accessed is None or (now_cmp - last_accessed) > _TOUCH_INTERVAL:
-                cursor.execute(
-                    """
-                    UPDATE user_sessions
-                    SET last_accessed = %s
-                    WHERE session_id = %s
-                    """,
-                    (now, session_id),
-                )
-                conn.commit()
 
             return {
                 "user_id": result["user_id"],
@@ -139,7 +119,6 @@ class InMemorySessionStore:
             del self.user_sessions_dict[session_id]
             return None
 
-        session_info["last_accessed"] = now
         user_id = session_info["user_id"]
         user_info = self.users_dict.get(user_id)
         if not user_info:
@@ -181,6 +160,19 @@ class PostgresUserStore:
 
     def __init__(self, get_session_fn: Callable[[], ContextManager[Any]]):
         self._get_session_fn = get_session_fn
+
+    @staticmethod
+    def _default_tier() -> str:
+        """Return the default tier for new users.
+
+        Non-production environments default to 'paid' so local dev/testing
+        has full feature access without manual DB updates.
+        """
+        import os
+
+        if os.getenv("ENVIRONMENT", "development") == "production":
+            return "registered"
+        return "paid"
 
     def get_or_create_user(
         self,
@@ -229,7 +221,7 @@ class PostgresUserStore:
                 VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
                 RETURNING id, email, name, tier, google_user_id
                 """,
-                (provider_user_id, email, name, "registered", "google"),
+                (provider_user_id, email, name, self._default_tier(), "google"),
             )
             result = cursor.fetchone()
             conn.commit()

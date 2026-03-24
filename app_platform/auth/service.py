@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import logging
 import secrets
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, Optional
 
-from app_platform.db.exceptions import AuthenticationError
+from app_platform.db.exceptions import AuthenticationError, SessionLookupError
 
 from .protocols import SessionStore, TokenVerifier, UserStore
 from .stores import InMemoryUserStore
 
 logger = logging.getLogger(__name__)
+
+_TOUCH_DEBOUNCE_INTERVAL = timedelta(minutes=5)
+_TOUCH_CACHE_RETENTION = timedelta(minutes=30)
 
 
 class AuthServiceBase:
@@ -38,6 +42,8 @@ class AuthServiceBase:
         self.fallback_session_store = fallback_session_store
         self.fallback_user_store = fallback_user_store
         self.last_cleanup = datetime.now(UTC)
+        self._touch_cache: dict[str, datetime] = {}
+        self._touch_lock = threading.Lock()
 
     def _generate_session_id(self) -> str:
         return secrets.token_urlsafe(32)
@@ -50,6 +56,36 @@ class AuthServiceBase:
 
     def _should_run_user_created_hook(self) -> bool:
         return not isinstance(self.user_store, InMemoryUserStore)
+
+    def _maybe_touch_session(self, store: SessionStore, session_id: str) -> None:
+        now = datetime.now(UTC)
+        with self._touch_lock:
+            prune_before = now - _TOUCH_CACHE_RETENTION
+            stale_session_ids = [
+                cached_session_id
+                for cached_session_id, touched_at in self._touch_cache.items()
+                if touched_at < prune_before
+            ]
+            for stale_session_id in stale_session_ids:
+                del self._touch_cache[stale_session_id]
+
+            last_touched = self._touch_cache.get(session_id)
+            if (
+                last_touched is not None
+                and (now - last_touched) < _TOUCH_DEBOUNCE_INTERVAL
+            ):
+                return
+
+            self._touch_cache[session_id] = now
+
+        try:
+            store.touch_session(session_id)
+        except Exception:
+            pass
+
+    def _clear_touch_cache(self, session_id: str) -> None:
+        with self._touch_lock:
+            self._touch_cache.pop(session_id, None)
 
     def verify_token(
         self,
@@ -115,6 +151,7 @@ class AuthServiceBase:
             try:
                 session = self.session_store.get_session(session_id)
                 if session is not None:
+                    self._maybe_touch_session(self.session_store, session_id)
                     return session
                 return None
 
@@ -123,26 +160,34 @@ class AuthServiceBase:
                     "Primary session lookup failed for session_id=%s...: %s",
                     session_id[:8], exc,
                 )
-                if self.strict_mode:
-                    raise AuthenticationError(
-                        f"Primary session lookup failed: {exc}",
+                if self.fallback_session_store is None or self.strict_mode:
+                    raise SessionLookupError(
+                        f"Primary session store unavailable: {exc}",
                         original_error=exc,
                     ) from exc
-                if self.fallback_session_store is None:
-                    return None
 
-            return self.fallback_session_store.get_session(session_id)
+            fallback_result = self.fallback_session_store.get_session(session_id)
+            if fallback_result is not None:
+                self._maybe_touch_session(self.fallback_session_store, session_id)
+                return fallback_result
+
+            raise SessionLookupError(
+                f"Primary session store unavailable; cannot verify session {session_id[:8]}...",
+            )
+
+        except SessionLookupError:
+            raise
 
         except Exception as exc:
-            logger.warning(
-                "Session lookup failed (outer) for session_id=%s...: %s",
-                session_id[:8], exc,
-            )
-            return None
+            raise SessionLookupError(
+                f"Session lookup failed: {exc}",
+                original_error=exc,
+            ) from exc
 
     def delete_session(self, session_id: str) -> bool:
         if not session_id:
             return False
+        self._clear_touch_cache(session_id)
 
         try:
             try:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "app-platform"
-version = "0.2.0"
+version = "0.3.0"
 description = "Generic web app infrastructure: PostgreSQL pooling, structured logging, rate limiting, FastAPI middleware, auth service, gateway proxy"
 readme = "README.md"
 license = "MIT"
@@ -21,23 +21,23 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "psycopg2-binary>=2.9",
+    "psycopg2-binary>=2.9,<3",
 ]
 
 [project.optional-dependencies]
 fastapi = [
-    "fastapi>=0.100",
-    "starlette",
-    "slowapi>=0.1.9",
-    "itsdangerous>=2.0",
+    "fastapi>=0.100,<1",
+    "starlette>=1.0,<2",
+    "slowapi>=0.1.9,<1",
+    "itsdangerous>=2.0,<3",
 ]
 auth-google = [
-    "google-auth>=2.0",
-    "requests>=2.20",
+    "google-auth>=2.0,<3",
+    "requests>=2.20,<3",
 ]
 gateway = [
-    "httpx>=0.24",
-    "fastapi>=0.100",
+    "httpx>=0.24,<1",
+    "fastapi>=0.100,<1",
 ]
 all = ["app-platform[fastapi,auth-google,gateway]"]
 

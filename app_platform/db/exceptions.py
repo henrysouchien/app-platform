@@ -174,6 +174,17 @@ class SessionNotFoundError(DatabaseError):
         super().__init__(f"Session not found: {session_id}", original_error, "session_lookup")
 
 
+class SessionLookupError(DatabaseError):
+    """Raised when session validity cannot be determined due to a transient failure."""
+
+    def __init__(
+        self,
+        message: str,
+        original_error: Optional[Exception] = None,
+    ):
+        super().__init__(message, original_error, "session_lookup")
+
+
 class NotFoundError(DatabaseError):
     """Generic base for resource-specific database not-found errors."""
 
@@ -247,6 +258,7 @@ __all__ = [
     "NotFoundError",
     "PoolExhaustionError",
     "SchemaError",
+    "SessionLookupError",
     "SessionNotFoundError",
     "TimeoutError",
     "TransactionError",

@@ -11,6 +11,8 @@ DEFAULT_HEADERS = [
     "X-API-Key",
     "X-Admin-Token",
     "X-Requested-With",
+    "X-Conversation-ID",
+    "X-Request-ID",
     "Accept",
     "Origin",
 ]
