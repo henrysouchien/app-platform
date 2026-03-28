@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -28,6 +29,15 @@ class GatewayConfig:
     ssl_verify: bool | str | Callable[[], bool | str] = True
     channel: str = "web"
     request_headers_factory: Callable[[Any], dict[str, str]] | None = None
+    context_enricher: Callable[[Any, Any, dict[str, Any]], dict[str, Any]] | None = None
+    min_chat_tier: str = "paid"
+
+    def __post_init__(self) -> None:
+        self.min_chat_tier = str(self.min_chat_tier or "paid").strip().lower() or "paid"
+        if self.min_chat_tier not in TIER_ORDER:
+            raise ValueError(
+                f"Invalid min_chat_tier={self.min_chat_tier!r}; must be one of {sorted(TIER_ORDER)}"
+            )
 
     def resolve_url(self) -> str:
         raw_url = self.gateway_url() if callable(self.gateway_url) else self.gateway_url
@@ -147,13 +157,13 @@ def create_gateway_router(
 
         purpose = str((chat_request.context or {}).get("purpose") or "chat").strip().lower() or "chat"
         user_tier = str(user.get("tier") or "registered").strip().lower() or "registered"
-        if purpose != "normalizer" and TIER_ORDER.get(user_tier, 0) < TIER_ORDER["paid"]:
+        if purpose != "normalizer" and TIER_ORDER.get(user_tier, 0) < TIER_ORDER[config.min_chat_tier]:
             raise HTTPException(
                 status_code=403,
                 detail={
                     "error": "upgrade_required",
-                    "message": "AI chat requires a paid subscription.",
-                    "tier_required": "paid",
+                    "message": f"AI chat requires a {config.min_chat_tier} subscription.",
+                    "tier_required": config.min_chat_tier,
                     "tier_current": user_tier,
                 },
             )
@@ -179,6 +189,20 @@ def create_gateway_router(
 
         try:
             upstream_payload = _build_gateway_chat_payload(chat_request, config.channel, user_key)
+            if config.context_enricher is not None:
+                original_context = upstream_payload.get("context") or {}
+                context_copy = copy.deepcopy(original_context)
+                try:
+                    returned_context = await asyncio.to_thread(
+                        config.context_enricher, request, user, context_copy
+                    )
+                    merged = {**original_context, **(returned_context or {})}
+                    merged["channel"] = config.channel
+                    if user_key is not None:
+                        merged["user_id"] = user_key
+                    upstream_payload["context"] = merged
+                except Exception:
+                    logger.warning("context_enricher raised; skipping", exc_info=True)
             extra_headers = None
             if config.request_headers_factory is not None:
                 try:

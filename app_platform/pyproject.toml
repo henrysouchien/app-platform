@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "app-platform"
-version = "0.3.0"
+version = "0.4.0"
 description = "Generic web app infrastructure: PostgreSQL pooling, structured logging, rate limiting, FastAPI middleware, auth service, gateway proxy"
 readme = "README.md"
 license = "MIT"

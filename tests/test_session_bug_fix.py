@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from itertools import count
-from pathlib import Path
 
 import psycopg2.extensions
 import psycopg2.pool as psycopg2_pool
 import pytest
-
-
-APP_PLATFORM_ROOT = Path(__file__).resolve().parents[1]
-if str(APP_PLATFORM_ROOT) not in sys.path:
-    sys.path.insert(0, str(APP_PLATFORM_ROOT))
 
 from app_platform.auth import AuthServiceBase, InMemoryUserStore, PostgresSessionStore
 from app_platform.db.pool import PoolManager
@@ -66,6 +59,7 @@ class FakeCursor:
                 "session_id": session_id,
                 "user_id": session["user_id"],
                 "expires_at": session["expires_at"],
+                "last_accessed": session["last_accessed"],
                 "email": user["email"],
                 "name": user["name"],
                 "tier": user["tier"],
