@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from app_platform.gateway import GatewayConfig, create_gateway_router
+from app_platform.gateway import GatewayConfig, GatewaySessionManager, create_gateway_router
 from app_platform.gateway.proxy import default_http_client_factory
 
 
@@ -16,6 +16,7 @@ def _build_client(
     user_by_session=None,
     config: GatewayConfig | None = None,
     http_client_factory=None,
+    session_manager: GatewaySessionManager | None = None,
 ):
     transport = httpx.MockTransport(handler)
 
@@ -39,6 +40,7 @@ def _build_client(
         get_current_user=get_current_user,
         http_client_factory=http_client_factory
         or (lambda: httpx.AsyncClient(transport=transport)),
+        session_manager=session_manager,
     )
 
     app = FastAPI()
@@ -106,6 +108,28 @@ def test_proxy_approval_uses_same_session_token() -> None:
 
     assert approval.status_code == 200
     assert captured["auth_headers"] == ["Bearer session-a", "Bearer session-a"]
+
+
+def test_proxy_uses_injected_session_manager() -> None:
+    captured = {"auth_header": None}
+    manager = GatewaySessionManager()
+    manager._token_store.set("101", "pre-seeded-token")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/tool-approval":
+            captured["auth_header"] = request.headers.get("authorization")
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler, session_manager=manager)[0] as client:
+        response = client.post(
+            "/api/gateway/tool-approval",
+            json={"tool_call_id": "t1", "nonce": "n1", "approved": True},
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 200
+    assert captured["auth_header"] == "Bearer pre-seeded-token"
 
 
 def test_proxy_chat_refreshes_token_on_401() -> None:
@@ -544,7 +568,7 @@ def test_proxy_approval_bypasses_stream_lock() -> None:
         raise AssertionError(f"Unexpected path: {request.url.path}")
 
     client, router = _build_client(handler)
-    router._session_manager._tokens["101"] = "token-1"
+    router._session_manager._token_store.set("101", "token-1")
     router._session_manager._stream_locks["101"] = _LockedOnly()  # type: ignore[assignment]
 
     with client:

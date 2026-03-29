@@ -251,12 +251,12 @@ def test_disconnect_during_stalled_stream_releases_lock_and_refreshes_session_to
 
                     user_lock = await router._session_manager.get_stream_lock("101")
                     for _ in range(100):
-                        if not user_lock.locked() and "101" not in router._session_manager._tokens:
+                        if not user_lock.locked() and router._session_manager.lookup_token("101") is None:
                             break
                         await asyncio.sleep(0.05)
 
                     assert not user_lock.locked()
-                    assert "101" not in router._session_manager._tokens
+                    assert router._session_manager.lookup_token("101") is None
 
                 disconnect_requested.clear()
                 second = await client.post(

@@ -133,11 +133,13 @@ def create_gateway_router(
     config: GatewayConfig,
     get_current_user: Callable[..., Any],
     http_client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
+    *,
+    session_manager: Optional[GatewaySessionManager] = None,
 ) -> APIRouter:
     """Create a gateway proxy router with injected config and auth."""
 
     router = APIRouter(tags=["gateway-proxy"])
-    session_manager = GatewaySessionManager()
+    session_manager = session_manager if session_manager is not None else GatewaySessionManager()
 
     def _create_http_client() -> httpx.AsyncClient:
         if http_client_factory is not None:
@@ -312,7 +314,7 @@ def create_gateway_router(
         """Proxy tool approval responses via the same gateway session token."""
 
         user_key = _get_user_key(user)
-        session_token = session_manager._tokens.get(user_key)
+        session_token = session_manager.lookup_token(user_key)
         if not session_token:
             raise HTTPException(
                 status_code=400,

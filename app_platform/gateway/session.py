@@ -3,17 +3,47 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 import httpx
 from fastapi import HTTPException
 
 
+class TokenStore(Protocol):
+    """Protocol for pluggable gateway session token storage."""
+
+    def get(self, key: str) -> str | None: ...
+    def set(self, key: str, value: str) -> None: ...
+    def delete(self, key: str) -> None: ...
+    def clear(self) -> None: ...
+
+
+class InMemoryTokenStore:
+    """Default in-memory token store backed by a plain dict."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self._data.get(key)
+
+    def set(self, key: str, value: str) -> None:
+        self._data[key] = value
+
+    def delete(self, key: str) -> None:
+        self._data.pop(key, None)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+
 class GatewaySessionManager:
     """Manage per-user gateway tokens and chat stream locks."""
 
-    def __init__(self) -> None:
-        self._tokens: dict[str, str] = {}
+    def __init__(self, token_store: TokenStore | None = None) -> None:
+        self._token_store: TokenStore = (
+            token_store if token_store is not None else InMemoryTokenStore()
+        )
         self._stream_locks: dict[str, asyncio.Lock] = {}
         self._state_lock = asyncio.Lock()
 
@@ -27,7 +57,7 @@ class GatewaySessionManager:
     ) -> str:
         """Resolve or refresh a per-user gateway session token."""
 
-        token = None if force_refresh else self._tokens.get(user_key)
+        token = None if force_refresh else self._token_store.get(user_key)
         if token:
             return token
 
@@ -36,7 +66,7 @@ class GatewaySessionManager:
             api_key=api_key_fn(),
             gateway_url=gateway_url_fn(),
         )
-        self._tokens[user_key] = token
+        self._token_store.set(user_key, token)
         return token
 
     async def get_stream_lock(self, user_key: str) -> asyncio.Lock:
@@ -52,12 +82,17 @@ class GatewaySessionManager:
     def invalidate_token(self, user_key: str) -> None:
         """Drop any cached gateway session token for the user."""
 
-        self._tokens.pop(user_key, None)
+        self._token_store.delete(user_key)
+
+    def lookup_token(self, user_key: str) -> str | None:
+        """Look up a cached token without auto-initializing."""
+
+        return self._token_store.get(user_key)
 
     def reset(self) -> None:
-        """Reset in-memory state without replacing dict objects."""
+        """Reset cached state without replacing existing containers when possible."""
 
-        self._tokens.clear()
+        self._token_store.clear()
         self._stream_locks.clear()
 
     async def _initialize_session(
@@ -110,4 +145,4 @@ class GatewaySessionManager:
         return None
 
 
-__all__ = ["GatewaySessionManager"]
+__all__ = ["GatewaySessionManager", "InMemoryTokenStore", "TokenStore"]
