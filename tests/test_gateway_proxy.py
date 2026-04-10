@@ -177,8 +177,106 @@ def test_proxy_approval_401_returns_error_without_refresh() -> None:
         )
 
     assert approval.status_code == 401
-    assert "nonce/session mismatch" in approval.text
+    body = approval.json()
+    assert body["error_code"] == "approval_failed"
+    assert body["detail"] == "nonce/session mismatch"
     assert calls["init"] == 1
+
+
+def test_proxy_approval_404_returns_expired_error_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            return httpx.Response(200, json={"session_token": "token-1"})
+        if request.url.path == "/api/chat":
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        if request.url.path == "/api/chat/tool-approval":
+            return httpx.Response(404, json={"error": "Unknown tool_call_id"})
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler)[0] as client:
+        client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+        approval = client.post(
+            "/api/gateway/tool-approval",
+            json={"tool_call_id": "t1", "nonce": "n1", "approved": True},
+            cookies={"session_id": "s-1"},
+        )
+
+    assert approval.status_code == 404
+    body = approval.json()
+    assert body["error_code"] == "approval_expired"
+    assert body["error"] == "Unknown tool_call_id"
+
+
+def test_proxy_approval_500_returns_generic_error_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            return httpx.Response(200, json={"session_token": "token-1"})
+        if request.url.path == "/api/chat":
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        if request.url.path == "/api/chat/tool-approval":
+            return httpx.Response(500, content="gateway approval blew up")
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler)[0] as client:
+        client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+        approval = client.post(
+            "/api/gateway/tool-approval",
+            json={"tool_call_id": "t1", "nonce": "n1", "approved": True},
+            cookies={"session_id": "s-1"},
+        )
+
+    assert approval.status_code == 500
+    body = approval.json()
+    assert body["error_code"] == "approval_failed"
+    assert "gateway approval blew up" in body["detail"]
+
+
+def test_proxy_approval_non_dict_json_body() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            return httpx.Response(200, json={"session_token": "token-1"})
+        if request.url.path == "/api/chat":
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        if request.url.path == "/api/chat/tool-approval":
+            return httpx.Response(422, json=["validation error"])
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler)[0] as client:
+        client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+        approval = client.post(
+            "/api/gateway/tool-approval",
+            json={"tool_call_id": "t1", "nonce": "n1", "approved": True},
+            cookies={"session_id": "s-1"},
+        )
+
+    assert approval.status_code == 422
+    body = approval.json()
+    assert body["error_code"] == "approval_failed"
+    assert "validation error" in body["detail"]
+
+
+def test_proxy_approval_upstream_cannot_overwrite_error_code() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            return httpx.Response(200, json={"session_token": "token-1"})
+        if request.url.path == "/api/chat":
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        if request.url.path == "/api/chat/tool-approval":
+            return httpx.Response(404, json={"error_code": "spoofed", "upstream_status": 999})
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler)[0] as client:
+        client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+        approval = client.post(
+            "/api/gateway/tool-approval",
+            json={"tool_call_id": "t1", "nonce": "n1", "approved": True},
+            cookies={"session_id": "s-1"},
+        )
+
+    assert approval.status_code == 404
+    body = approval.json()
+    assert body["error_code"] == "approval_expired"
+    assert body["upstream_status"] == 404
 
 
 def test_proxy_rejects_unauthenticated_request() -> None:

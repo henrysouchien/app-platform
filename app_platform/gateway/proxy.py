@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -18,6 +20,16 @@ from .session import GatewaySessionManager
 
 logger = logging.getLogger(__name__)
 _RESERVED_HEADERS = frozenset({"authorization"})
+_KNOWN_UPSTREAM_ERRORS = frozenset(
+    {
+        "auth_expired",
+        "cross_user_reuse",
+        "missing_user_id",
+        "strict_mode_default_user",
+        "credentials_unavailable",
+        "credentials_timeout",
+    }
+)
 
 
 @dataclass
@@ -95,16 +107,22 @@ def _build_gateway_chat_payload(
     chat_request: GatewayChatRequest,
     channel: str,
     user_key: str | None = None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Build upstream chat payload with enforced channel/user_id and no model field."""
 
     upstream_context = {**(chat_request.context or {}), "channel": channel}
     if user_key is not None:
         upstream_context["user_id"] = user_key
-    return {
+    payload = {
         "messages": chat_request.messages,
         "context": upstream_context,
     }
+    if user_key is not None:
+        payload["user_id"] = user_key
+    if request_id is not None:
+        payload["request_id"] = request_id
+    return payload
 
 
 async def _open_gateway_chat_stream(
@@ -127,6 +145,26 @@ async def _open_gateway_chat_stream(
         json=payload,
     )
     return await client.send(request, stream=True)
+
+
+async def _classify_upstream_error(response: httpx.Response) -> tuple[str, dict[str, Any] | None]:
+    """Classify gateway pre-stream errors without parsing SSE streams."""
+
+    body_bytes = await response.aread()
+    try:
+        body = json.loads(body_bytes)
+    except (ValueError, TypeError):
+        body = None
+
+    if isinstance(body, dict):
+        error_code = body.get("error")
+        if error_code in _KNOWN_UPSTREAM_ERRORS:
+            return str(error_code), body
+
+    if response.status_code == 401:
+        return "session_expired", body if isinstance(body, dict) else None
+
+    return "unknown", body if isinstance(body, dict) else None
 
 
 def create_gateway_router(
@@ -190,7 +228,27 @@ def create_gateway_router(
                 lock_released = True
 
         try:
-            upstream_payload = _build_gateway_chat_payload(chat_request, config.channel, user_key)
+            extra_headers: dict[str, str] = {}
+            if config.request_headers_factory is not None:
+                try:
+                    factory_headers = config.request_headers_factory(request)
+                    extra_headers.update(factory_headers or {})
+                except Exception:
+                    logger.warning("request_headers_factory raised; skipping extra headers", exc_info=True)
+
+            request_id = (
+                extra_headers.get("X-Request-ID")
+                or request.headers.get("X-Request-ID")
+                or str(uuid.uuid4())
+            )
+            extra_headers["X-Request-ID"] = request_id
+
+            upstream_payload = _build_gateway_chat_payload(
+                chat_request,
+                config.channel,
+                user_key,
+                request_id,
+            )
             if config.context_enricher is not None:
                 original_context = upstream_payload.get("context") or {}
                 context_copy = copy.deepcopy(original_context)
@@ -205,12 +263,6 @@ def create_gateway_router(
                     upstream_payload["context"] = merged
                 except Exception:
                     logger.warning("context_enricher raised; skipping", exc_info=True)
-            extra_headers = None
-            if config.request_headers_factory is not None:
-                try:
-                    extra_headers = config.request_headers_factory(request)
-                except Exception:
-                    logger.warning("request_headers_factory raised; skipping extra headers", exc_info=True)
             session_token = await session_manager.get_token(
                 user_key=user_key,
                 client=client,
@@ -219,24 +271,9 @@ def create_gateway_router(
             )
             gateway_url = config.resolve_url()
 
-            upstream_response = await _open_gateway_chat_stream(
-                client=client,
-                gateway_url=gateway_url,
-                session_token=session_token,
-                payload=upstream_payload,
-                extra_headers=extra_headers,
-            )
-
-            if upstream_response.status_code == 401:
-                await upstream_response.aclose()
-                upstream_response = None
-                session_token = await session_manager.get_token(
-                    user_key=user_key,
-                    client=client,
-                    api_key_fn=config.resolve_api_key,
-                    gateway_url_fn=config.resolve_url,
-                    force_refresh=True,
-                )
+            session_expired_retried = False
+            auth_expired_retried = False
+            while True:
                 upstream_response = await _open_gateway_chat_stream(
                     client=client,
                     gateway_url=gateway_url,
@@ -245,14 +282,53 @@ def create_gateway_router(
                     extra_headers=extra_headers,
                 )
 
-            if upstream_response.status_code != 200:
+                if upstream_response.status_code == 200:
+                    break
+
+                error_code, _error_body = await _classify_upstream_error(upstream_response)
+                if error_code == "session_expired" and not session_expired_retried:
+                    session_expired_retried = True
+                    logger.info(
+                        "gateway chat retrying after session_expired request_id=%s",
+                        request_id,
+                    )
+                    await upstream_response.aclose()
+                    upstream_response = None
+                    session_token = await session_manager.get_token(
+                        user_key=user_key,
+                        client=client,
+                        api_key_fn=config.resolve_api_key,
+                        gateway_url_fn=config.resolve_url,
+                        force_refresh=True,
+                    )
+                    continue
+
+                if error_code == "auth_expired" and not auth_expired_retried:
+                    auth_expired_retried = True
+                    logger.info(
+                        "gateway chat retrying after auth_expired request_id=%s",
+                        request_id,
+                    )
+                    await upstream_response.aclose()
+                    upstream_response = None
+                    session_manager.invalidate_token(user_key)
+                    session_token = await session_manager.get_token(
+                        user_key=user_key,
+                        client=client,
+                        api_key_fn=config.resolve_api_key,
+                        gateway_url_fn=config.resolve_url,
+                        force_refresh=True,
+                    )
+                    continue
+
                 detail_bytes = await upstream_response.aread()
-                detail = detail_bytes.decode("utf-8", errors="ignore")
+                status_code = upstream_response.status_code
+                media_type = upstream_response.headers.get("content-type") or "text/plain"
                 await release_resources()
                 return Response(
-                    content=detail or f"Gateway error ({upstream_response.status_code})",
-                    status_code=upstream_response.status_code,
-                    media_type="text/plain",
+                    content=detail_bytes or f"Gateway error ({status_code})".encode("utf-8"),
+                    status_code=status_code,
+                    media_type=media_type,
                 )
 
             async def event_stream():
@@ -343,11 +419,16 @@ def create_gateway_router(
 
         body_text = response.text
         if response.status_code >= 400:
-            return Response(
-                content=body_text or "Gateway approval failed",
-                status_code=response.status_code,
-                media_type="text/plain",
-            )
+            error_code = "approval_expired" if response.status_code == 404 else "approval_failed"
+            try:
+                upstream_body = response.json()
+                if not isinstance(upstream_body, dict):
+                    upstream_body = {"detail": str(upstream_body)}
+            except (ValueError, TypeError):
+                upstream_body = {"detail": body_text or "Gateway approval failed"}
+
+            result = {**upstream_body, "error_code": error_code, "upstream_status": response.status_code}
+            return JSONResponse(content=result, status_code=response.status_code)
 
         if body_text:
             try:
