@@ -1,5 +1,7 @@
 """Public app_platform exports for the extracted platform package."""
 
+__version__ = "0.6.1"
+
 from .db import (
     AuthenticationError,
     ConnectionError,
@@ -64,6 +66,7 @@ from .middleware import (
 )
 
 __all__ = [
+    "__version__",
     "APP_LOG_FORMAT",
     "ApiKeyRegistry",
     "AuthenticationError",
