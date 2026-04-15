@@ -117,6 +117,7 @@ def _build_gateway_chat_payload(
     payload = {
         "messages": chat_request.messages,
         "context": upstream_context,
+        "metadata": chat_request.metadata or {},
     }
     if user_key is not None:
         payload["user_id"] = user_key
@@ -196,6 +197,11 @@ def create_gateway_router(
         """Proxy web-channel chat stream to the gateway."""
 
         purpose = str((chat_request.context or {}).get("purpose") or "chat").strip().lower() or "chat"
+        conversation_id: str | None = None
+        if purpose == "research_workspace":
+            _thread_id = (chat_request.context or {}).get("thread_id")
+            if _thread_id is not None and str(_thread_id).strip():
+                conversation_id = str(_thread_id).strip()
         user_tier = str(user.get("tier") or "registered").strip().lower() or "registered"
         if purpose != "normalizer" and TIER_ORDER.get(user_tier, 0) < TIER_ORDER[config.min_chat_tier]:
             raise HTTPException(
@@ -209,7 +215,7 @@ def create_gateway_router(
             )
 
         user_key = _get_user_key(user)
-        user_lock = await session_manager.get_stream_lock(user_key)
+        user_lock = await session_manager.get_stream_lock(user_key, conversation_id)
         if user_lock.locked():
             raise HTTPException(status_code=409, detail="A chat stream is already active")
 
@@ -268,6 +274,7 @@ def create_gateway_router(
                 client=client,
                 api_key_fn=config.resolve_api_key,
                 gateway_url_fn=config.resolve_url,
+                conversation_id=conversation_id,
             )
             gateway_url = config.resolve_url()
 
@@ -300,6 +307,7 @@ def create_gateway_router(
                         api_key_fn=config.resolve_api_key,
                         gateway_url_fn=config.resolve_url,
                         force_refresh=True,
+                        conversation_id=conversation_id,
                     )
                     continue
 
@@ -311,13 +319,14 @@ def create_gateway_router(
                     )
                     await upstream_response.aclose()
                     upstream_response = None
-                    session_manager.invalidate_token(user_key)
+                    session_manager.invalidate_token(user_key, conversation_id)
                     session_token = await session_manager.get_token(
                         user_key=user_key,
                         client=client,
                         api_key_fn=config.resolve_api_key,
                         gateway_url_fn=config.resolve_url,
                         force_refresh=True,
+                        conversation_id=conversation_id,
                     )
                     continue
 
@@ -364,7 +373,7 @@ def create_gateway_router(
                         pass
                     await release_resources()
                     if _disconnected:
-                        session_manager.invalidate_token(user_key)
+                        session_manager.invalidate_token(user_key, conversation_id)
 
             return StreamingResponse(
                 event_stream(),

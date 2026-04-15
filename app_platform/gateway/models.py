@@ -12,6 +12,7 @@ class GatewayChatRequest(BaseModel):
 
     messages: list[dict[str, Any]]
     context: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     model: Optional[str] = None
 
 

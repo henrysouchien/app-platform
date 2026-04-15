@@ -6,10 +6,11 @@ from pydantic import ValidationError
 from app_platform.gateway.models import GatewayChatRequest, GatewayToolApprovalRequest
 
 
-def test_gateway_chat_request_defaults_context_and_model() -> None:
+def test_gateway_chat_request_defaults_context_metadata_and_model() -> None:
     payload = GatewayChatRequest(messages=[{"role": "user", "content": "hello"}])
 
     assert payload.context == {}
+    assert payload.metadata == {}
     assert payload.model is None
 
 

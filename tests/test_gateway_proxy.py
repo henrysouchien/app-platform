@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import httpx
@@ -64,6 +65,25 @@ def _sse_response(payload: bytes) -> httpx.Response:
     )
 
 
+class _LockedOnly:
+    def locked(self) -> bool:
+        return True
+
+
+def _research_chat_payload(thread_id: object = "100") -> dict:
+    payload = _chat_payload()
+    payload["context"] = {
+        **payload["context"],
+        "purpose": "research_workspace",
+        "thread_id": thread_id,
+    }
+    return payload
+
+
+def _consumer_hash(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
 def test_proxy_caches_gateway_session_token() -> None:
     calls = {"init": 0}
 
@@ -82,6 +102,33 @@ def test_proxy_caches_gateway_session_token() -> None:
     assert first.status_code == 200
     assert second.status_code == 200
     assert calls["init"] == 1
+
+
+def test_proxy_forwards_metadata_to_upstream_chat() -> None:
+    captured = {"payload": None}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            return httpx.Response(200, json={"session_token": "token-1"})
+        if request.url.path == "/api/chat":
+            captured["payload"] = json.loads(request.content.decode("utf-8"))
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler)[0] as client:
+        response = client.post(
+            "/api/gateway/chat",
+            json={
+                **_chat_payload(),
+                "metadata": {"document_context": {"source_id": "DOC_1", "source_type": "filing"}},
+            },
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 200
+    assert captured["payload"]["metadata"] == {
+        "document_context": {"source_id": "DOC_1", "source_type": "filing"}
+    }
 
 
 def test_proxy_approval_uses_same_session_token() -> None:
@@ -636,6 +683,188 @@ def test_proxy_forwards_request_headers_from_factory_and_filters_reserved_header
     assert captured["headers"]["x-conversation-id"] == "conv-789"
     assert captured["headers"]["x-request-id"] == "req-123"
     assert captured["headers"]["authorization"] == "Bearer token-1"
+
+
+def test_proxy_allows_concurrent_research_streams_for_different_threads() -> None:
+    calls = {"init": 0, "chat": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            calls["init"] += 1
+            return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+        if request.url.path == "/api/chat":
+            calls["chat"] += 1
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101:t:100"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post(
+            "/api/gateway/chat",
+            json=_research_chat_payload("200"),
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 200
+    assert calls == {"init": 1, "chat": 1}
+    assert router._session_manager.lookup_token("101", "200") == "token-1"
+    assert router._session_manager.lookup_token("101") is None
+
+
+def test_proxy_rejects_concurrent_research_streams_for_same_thread() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Upstream should not be called when research thread lock is held")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101:t:100"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post(
+            "/api/gateway/chat",
+            json=_research_chat_payload("100"),
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_proxy_portfolio_chat_still_rejects_concurrent_stream() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Upstream should not be called when user lock is held")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+
+    assert response.status_code == 409
+
+
+def test_proxy_research_without_thread_id_falls_back_to_user_lock() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Upstream should not be called when user lock is held")
+
+    payload = _research_chat_payload()
+    payload["context"].pop("thread_id")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post("/api/gateway/chat", json=payload, cookies={"session_id": "s-1"})
+
+    assert response.status_code == 409
+
+
+def test_proxy_research_does_not_block_portfolio_chat() -> None:
+    calls = {"init": 0, "chat": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            calls["init"] += 1
+            return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+        if request.url.path == "/api/chat":
+            calls["chat"] += 1
+            return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101:t:100"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post("/api/gateway/chat", json=_chat_payload(), cookies={"session_id": "s-1"})
+
+    assert response.status_code == 200
+    assert calls == {"init": 1, "chat": 1}
+    assert router._session_manager.lookup_token("101") == "token-1"
+
+
+def test_proxy_research_whitespace_thread_id_falls_back_to_user_lock() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Upstream should not be called when user lock is held")
+
+    client, router = _build_client(handler)
+    router._session_manager._stream_locks["101"] = _LockedOnly()  # type: ignore[assignment]
+
+    with client:
+        response = client.post(
+            "/api/gateway/chat",
+            json=_research_chat_payload(" "),
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 409
+
+
+def test_proxy_research_session_expired_retries_with_conversation_token() -> None:
+    calls = {"init": 0, "chat_auth": []}
+    manager = GatewaySessionManager()
+    manager._token_store.set("101", "portfolio-token")
+    manager._consumer_hashes["101"] = _consumer_hash("gateway-api-key")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            calls["init"] += 1
+            return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+        if request.url.path == "/api/chat":
+            auth = request.headers.get("authorization")
+            calls["chat_auth"].append(auth)
+            if auth == "Bearer token-1":
+                return httpx.Response(401, content="expired")
+            if auth == "Bearer token-2":
+                return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+            raise AssertionError(f"Unexpected authorization header: {auth}")
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler, session_manager=manager)[0] as client:
+        response = client.post(
+            "/api/gateway/chat",
+            json=_research_chat_payload("100"),
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 200
+    assert calls["init"] == 2
+    assert calls["chat_auth"] == ["Bearer token-1", "Bearer token-2"]
+    assert manager.lookup_token("101") == "portfolio-token"
+    assert manager.lookup_token("101", "100") == "token-2"
+
+
+def test_proxy_research_auth_expired_invalidates_conversation_token_only() -> None:
+    calls = {"init": 0, "chat_auth": []}
+    manager = GatewaySessionManager()
+    manager._token_store.set("101", "portfolio-token")
+    manager._consumer_hashes["101"] = _consumer_hash("gateway-api-key")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat/init":
+            calls["init"] += 1
+            return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+        if request.url.path == "/api/chat":
+            auth = request.headers.get("authorization")
+            calls["chat_auth"].append(auth)
+            if auth == "Bearer token-1":
+                return httpx.Response(401, json={"error": "auth_expired"})
+            if auth == "Bearer token-2":
+                return _sse_response(b'data: {"type":"stream_complete"}\n\n')
+            raise AssertionError(f"Unexpected authorization header: {auth}")
+        raise AssertionError(f"Unexpected path: {request.url.path}")
+
+    with _build_client(handler, session_manager=manager)[0] as client:
+        response = client.post(
+            "/api/gateway/chat",
+            json=_research_chat_payload("100"),
+            cookies={"session_id": "s-1"},
+        )
+
+    assert response.status_code == 200
+    assert calls["init"] == 2
+    assert calls["chat_auth"] == ["Bearer token-1", "Bearer token-2"]
+    assert manager.lookup_token("101") == "portfolio-token"
+    assert manager.lookup_token("101", "100") == "token-2"
 
 
 def test_proxy_rejects_concurrent_stream() -> None:

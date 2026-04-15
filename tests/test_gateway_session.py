@@ -112,6 +112,24 @@ def test_gateway_session_manager_returns_per_user_stream_locks() -> None:
     asyncio.run(run())
 
 
+def test_gateway_session_manager_conversation_locks_are_independent() -> None:
+    manager = GatewaySessionManager()
+
+    async def run() -> None:
+        per_user = await manager.get_stream_lock("user-1")
+        per_user_again = await manager.get_stream_lock("user-1", None)
+        thread_one = await manager.get_stream_lock("user-1", "thread-1")
+        thread_one_again = await manager.get_stream_lock("user-1", "thread-1")
+        thread_two = await manager.get_stream_lock("user-1", "thread-2")
+
+        assert per_user is per_user_again
+        assert thread_one is thread_one_again
+        assert thread_one is not thread_two
+        assert per_user is not thread_one
+
+    asyncio.run(run())
+
+
 def test_gateway_session_manager_lookup_token() -> None:
     manager = GatewaySessionManager()
 
@@ -170,6 +188,112 @@ def test_gateway_session_manager_force_refresh_updates_cached_token() -> None:
             assert second == "token-2"
             assert manager.lookup_token("user-1") == "token-2"
             assert calls["init"] == 2
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_gateway_session_manager_conversation_tokens_are_independent() -> None:
+    manager = GatewaySessionManager()
+    calls = {"init": 0, "payloads": []}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["init"] += 1
+        calls["payloads"].append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            per_user = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+            )
+            thread_one = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="thread-1",
+            )
+            thread_one_again = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="thread-1",
+            )
+            thread_two = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="thread-2",
+            )
+
+            assert per_user == "token-1"
+            assert thread_one == "token-2"
+            assert thread_one_again == "token-2"
+            assert thread_two == "token-3"
+            assert manager.lookup_token("user-1") == "token-1"
+            assert manager.lookup_token("user-1", "thread-1") == "token-2"
+            assert manager.lookup_token("user-1", "thread-2") == "token-3"
+            assert calls["init"] == 3
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+    assert calls["payloads"] == [
+        {"api_key": "api-key", "user_id": "user-1"},
+        {"api_key": "api-key", "user_id": "user-1"},
+        {"api_key": "api-key", "user_id": "user-1"},
+    ]
+
+
+def test_gateway_session_manager_invalidate_scoped_to_conversation() -> None:
+    manager = GatewaySessionManager()
+    calls = {"init": 0}
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls["init"] += 1
+        return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            per_user = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+            )
+            thread_one = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="thread-1",
+            )
+            thread_two = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="thread-2",
+            )
+
+            manager.invalidate_token("user-1", "thread-1")
+
+            assert per_user == "token-1"
+            assert thread_one == "token-2"
+            assert thread_two == "token-3"
+            assert manager.lookup_token("user-1") == "token-1"
+            assert manager.lookup_token("user-1", "thread-1") is None
+            assert manager.lookup_token("user-1", "thread-2") == "token-3"
         finally:
             await client.aclose()
 

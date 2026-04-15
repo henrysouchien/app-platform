@@ -63,6 +63,14 @@ class GatewaySessionManager:
         self._stream_locks: dict[str, asyncio.Lock] = {}
         self._state_lock = asyncio.Lock()
 
+    @staticmethod
+    def _token_key(user_key: str, conversation_id: str | None = None) -> str:
+        """Build a composite key for per-conversation state."""
+
+        if conversation_id:
+            return f"{user_key}:t:{conversation_id}"
+        return user_key
+
     async def get_token(
         self,
         user_key: str,
@@ -70,15 +78,17 @@ class GatewaySessionManager:
         api_key_fn: Callable[[], str],
         gateway_url_fn: Callable[[], str],
         force_refresh: bool = False,
+        conversation_id: str | None = None,
     ) -> str:
-        """Resolve or refresh a per-user gateway session token."""
+        """Resolve or refresh a gateway session token."""
 
+        token_key = self._token_key(user_key, conversation_id)
         api_key = api_key_fn()
         consumer_hash = _consumer_key_hash(api_key)
-        if self._consumer_hashes.get(user_key) != consumer_hash:
+        if self._consumer_hashes.get(token_key) != consumer_hash:
             force_refresh = True
 
-        token = None if force_refresh else self._token_store.get(user_key)
+        token = None if force_refresh else self._token_store.get(token_key)
         if token:
             return token
 
@@ -88,30 +98,34 @@ class GatewaySessionManager:
             gateway_url=gateway_url_fn(),
             user_id=user_key,
         )
-        self._token_store.set(user_key, token)
-        self._consumer_hashes[user_key] = consumer_hash
+        self._token_store.set(token_key, token)
+        self._consumer_hashes[token_key] = consumer_hash
         return token
 
-    async def get_stream_lock(self, user_key: str) -> asyncio.Lock:
-        """Return the per-user chat stream lock."""
+    async def get_stream_lock(
+        self, user_key: str, conversation_id: str | None = None
+    ) -> asyncio.Lock:
+        """Return the per-user or per-conversation chat stream lock."""
 
         async with self._state_lock:
-            lock = self._stream_locks.get(user_key)
+            lock_key = self._token_key(user_key, conversation_id)
+            lock = self._stream_locks.get(lock_key)
             if lock is None:
                 lock = asyncio.Lock()
-                self._stream_locks[user_key] = lock
+                self._stream_locks[lock_key] = lock
             return lock
 
-    def invalidate_token(self, user_key: str) -> None:
-        """Drop any cached gateway session token for the user."""
+    def invalidate_token(self, user_key: str, conversation_id: str | None = None) -> None:
+        """Drop any cached gateway session token for the user or conversation."""
 
-        self._token_store.delete(user_key)
-        self._consumer_hashes.pop(user_key, None)
+        token_key = self._token_key(user_key, conversation_id)
+        self._token_store.delete(token_key)
+        self._consumer_hashes.pop(token_key, None)
 
-    def lookup_token(self, user_key: str) -> str | None:
+    def lookup_token(self, user_key: str, conversation_id: str | None = None) -> str | None:
         """Look up a cached token without auto-initializing."""
 
-        return self._token_store.get(user_key)
+        return self._token_store.get(self._token_key(user_key, conversation_id))
 
     def reset(self) -> None:
         """Reset cached state without replacing existing containers when possible."""
