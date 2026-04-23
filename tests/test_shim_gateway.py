@@ -75,7 +75,11 @@ def test_gateway_proxy_shim_reads_env_at_request_time(monkeypatch: pytest.Monkey
 
     assert response.status_code == 200
     assert captured["verify"] is False
-    assert captured["init_payload"] == {"api_key": "env-api-key", "user_id": "101"}
+    assert captured["init_payload"] == {
+        "api_key": "env-api-key",
+        "user_id": "101",
+        "context": {"channel": "web"},
+    }
     assert captured["chat_url"] == "http://gateway.from.env/api/chat"
 
 

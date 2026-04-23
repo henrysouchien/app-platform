@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
+import subprocess
+import sys
+import textwrap
 from contextlib import asynccontextmanager
 
 import httpx
+import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 import uvicorn
 
 from app_platform.gateway import GatewayConfig, create_gateway_router
+from app_platform.gateway.models import GatewayChatRequest
+from app_platform.gateway.proxy import _build_gateway_chat_payload, _get_user_key
 
 
 def _build_app(
@@ -61,6 +68,35 @@ def _sse_response(payload: bytes) -> httpx.Response:
         headers={"content-type": "text/event-stream"},
         stream=httpx.ByteStream(payload),
     )
+
+
+def test_build_gateway_chat_payload_enforces_web_channel_and_user_id() -> None:
+    payload = _build_gateway_chat_payload(
+        GatewayChatRequest.model_validate(_chat_payload()),
+        "web",
+        user_key="101",
+        request_id="req-1",
+    )
+
+    assert payload == {
+        "messages": [{"role": "user", "content": "hello"}],
+        "context": {
+            "portfolio_name": "Main Portfolio",
+            "channel": "web",
+            "user_id": "101",
+        },
+        "metadata": {},
+        "user_id": "101",
+        "request_id": "req-1",
+    }
+
+
+def test_get_user_key_requires_primary_user_id() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _get_user_key({"google_user_id": "fallback", "email": "fallback@example.com"})
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Invalid user identity (user_id missing — auth middleware bug)"
 
 
 def test_registered_user_chat_requires_paid_tier() -> None:
@@ -272,3 +308,107 @@ def test_disconnect_during_stalled_stream_releases_lock_and_refreshes_session_to
         assert calls["chat_auth"] == ["Bearer token-1", "Bearer token-2"]
 
     asyncio.run(run())
+
+
+def test_proxy_auth_expired_retries_with_reinit_and_same_payload() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+
+        import httpx
+        from fastapi import FastAPI, HTTPException, Request
+        from fastapi.testclient import TestClient
+
+        from app_platform.gateway import GatewayConfig, create_gateway_router
+
+        calls = {"init_payloads": [], "chat_payloads": [], "chat_auth": []}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/chat/init":
+                calls["init_payloads"].append(json.loads(request.content.decode("utf-8")))
+                token = f"token-{len(calls['init_payloads'])}"
+                return httpx.Response(200, json={"session_token": token})
+            if request.url.path == "/api/chat":
+                calls["chat_payloads"].append(json.loads(request.content.decode("utf-8")))
+                calls["chat_auth"].append(request.headers.get("authorization"))
+                if len(calls["chat_auth"]) == 1:
+                    return httpx.Response(401, json={"error": "auth_expired"})
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=httpx.ByteStream(b'data: {"type":"stream_complete"}\\n\\n'),
+                )
+            raise AssertionError(f"Unexpected path: {request.url.path}")
+
+        transport = httpx.MockTransport(handler)
+
+        def get_current_user(request: Request) -> dict:
+            del request
+            return {"user_id": 101, "email": "test@example.com", "tier": "paid"}
+
+        router = create_gateway_router(
+            GatewayConfig(
+                gateway_url="http://gateway.local",
+                api_key="gateway-api-key",
+                ssl_verify=True,
+            ),
+            get_current_user=get_current_user,
+            http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+        )
+
+        app = FastAPI()
+        app.include_router(router, prefix="/api/gateway")
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/gateway/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "context": {"portfolio_name": "Main Portfolio"},
+                },
+                cookies={"session_id": "s-1"},
+            )
+
+        assert response.status_code == 200
+        print(json.dumps(calls, sort_keys=True))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    calls = json.loads(result.stdout)
+
+    assert calls["init_payloads"] == [
+        {
+            "api_key": "gateway-api-key",
+            "user_id": "101",
+            "user_email": "test@example.com",
+            "context": {"channel": "web"},
+        },
+        {
+            "api_key": "gateway-api-key",
+            "user_id": "101",
+            "user_email": "test@example.com",
+            "context": {"channel": "web"},
+        },
+    ]
+    assert calls["chat_payloads"] == [
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "context": {"portfolio_name": "Main Portfolio", "channel": "web", "user_id": "101"},
+            "metadata": {},
+            "user_id": "101",
+            "request_id": calls["chat_payloads"][0]["request_id"],
+        },
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "context": {"portfolio_name": "Main Portfolio", "channel": "web", "user_id": "101"},
+            "metadata": {},
+            "user_id": "101",
+            "request_id": calls["chat_payloads"][0]["request_id"],
+        },
+    ]
+    assert calls["chat_auth"] == ["Bearer token-1", "Bearer token-2"]

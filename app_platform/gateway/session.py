@@ -79,6 +79,8 @@ class GatewaySessionManager:
         gateway_url_fn: Callable[[], str],
         force_refresh: bool = False,
         conversation_id: str | None = None,
+        channel: str | None = None,
+        user_email: str | None = None,
     ) -> str:
         """Resolve or refresh a gateway session token."""
 
@@ -97,6 +99,8 @@ class GatewaySessionManager:
             api_key=api_key,
             gateway_url=gateway_url_fn(),
             user_id=user_key,
+            channel=channel,
+            user_email=user_email,
         )
         self._token_store.set(token_key, token)
         self._consumer_hashes[token_key] = consumer_hash
@@ -140,12 +144,18 @@ class GatewaySessionManager:
         api_key: str,
         gateway_url: str,
         user_id: str | None = None,
+        channel: str | None = None,
+        user_email: str | None = None,
     ) -> str:
         """Create a new gateway session token via API key auth."""
 
         init_payload = {"api_key": api_key}
         if user_id is not None:
             init_payload["user_id"] = user_id
+        if user_email is not None:
+            init_payload["user_email"] = user_email
+        if channel:
+            init_payload["context"] = {"channel": str(channel)}
 
         response = await client.post(
             f"{gateway_url}/api/chat/init",

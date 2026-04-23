@@ -94,13 +94,13 @@ def default_http_client_factory(ssl_verify: bool | str) -> httpx.AsyncClient:
 def _get_user_key(user: dict[str, Any]) -> str:
     """Build a stable user key for per-user state."""
 
-    if user.get("user_id") is not None:
-        return str(user["user_id"])
-    if user.get("google_user_id") is not None:
-        return str(user["google_user_id"])
-    if user.get("email"):
-        return str(user["email"])
-    raise HTTPException(status_code=401, detail="Invalid user identity")
+    user_id = user.get("user_id")
+    if user_id is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid user identity (user_id missing — auth middleware bug)",
+        )
+    return str(user_id)
 
 
 def _build_gateway_chat_payload(
@@ -215,6 +215,10 @@ def create_gateway_router(
             )
 
         user_key = _get_user_key(user)
+        raw_user_email = user.get("email")
+        user_email = None
+        if raw_user_email is not None and str(raw_user_email).strip():
+            user_email = str(raw_user_email).strip()
         user_lock = await session_manager.get_stream_lock(user_key, conversation_id)
         if user_lock.locked():
             raise HTTPException(status_code=409, detail="A chat stream is already active")
@@ -275,6 +279,8 @@ def create_gateway_router(
                 api_key_fn=config.resolve_api_key,
                 gateway_url_fn=config.resolve_url,
                 conversation_id=conversation_id,
+                channel=config.channel,
+                user_email=user_email,
             )
             gateway_url = config.resolve_url()
 
@@ -308,6 +314,8 @@ def create_gateway_router(
                         gateway_url_fn=config.resolve_url,
                         force_refresh=True,
                         conversation_id=conversation_id,
+                        channel=config.channel,
+                        user_email=user_email,
                     )
                     continue
 
@@ -327,6 +335,8 @@ def create_gateway_router(
                         gateway_url_fn=config.resolve_url,
                         force_refresh=True,
                         conversation_id=conversation_id,
+                        channel=config.channel,
+                        user_email=user_email,
                     )
                     continue
 
