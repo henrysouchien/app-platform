@@ -23,7 +23,7 @@ def log_errors(severity: str = "medium"):
                 except Exception as exc:  # pragma: no cover - exercised by tests
                     log_error(
                         source=f"{func.__module__}:{func.__name__}",
-                        message=f"{func.__name__} failed: {type(exc).__name__}: {exc}",
+                        message=f"{func.__name__} failed",
                         exc=exc,
                         severity=severity,
                     )
@@ -38,7 +38,7 @@ def log_errors(severity: str = "medium"):
             except Exception as exc:
                 log_error(
                     source=f"{func.__module__}:{func.__name__}",
-                    message=f"{func.__name__} failed: {type(exc).__name__}: {exc}",
+                    message=f"{func.__name__} failed",
                     exc=exc,
                     severity=severity,
                 )

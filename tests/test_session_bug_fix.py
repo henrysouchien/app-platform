@@ -43,6 +43,10 @@ class FakeCursor:
 
     def execute(self, query: str, params=None) -> None:
         normalized = " ".join(query.split())
+        if normalized == "SET search_path TO public":
+            self._result = None
+            return
+
         if normalized == "SELECT 1":
             self._result = (1,)
             return

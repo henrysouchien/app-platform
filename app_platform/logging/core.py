@@ -7,7 +7,6 @@ import logging
 import os
 import threading
 import time
-import traceback
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
@@ -22,15 +21,12 @@ VERY_SLOW_OPERATION_THRESHOLD = 5.0
 
 DEDUP_WINDOW_S = 300
 MAX_DEDUP_KEYS = 500
+_THIRD_PARTY_DEBUG_CLAMP = ("botocore", "boto3", "urllib3", "s3transfer")
 
 
 def _json_default(value: Any) -> Any:
-    """JSON serializer fallback for non-serializable objects."""
-    if isinstance(value, (set, frozenset)):
-        return sorted(value)
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value)
+    """Return a value-free fallback for non-serializable log objects."""
+    return {"value_type": type(value).__name__}
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -136,14 +132,12 @@ def _normalize_exc(
     exc: Any,
     details: dict[str, Any],
 ) -> tuple[str | None, str | None, str | None]:
-    """Normalize exception payload for structured error events."""
+    """Project exception identity without persisting its value or traceback."""
     if isinstance(exc, BaseException):
-        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        return str(exc), type(exc).__name__, tb
+        return None, type(exc).__name__, None
 
     if exc is not None:
-        details.setdefault("context", exc)
-        return str(exc), None, None
+        return None, type(exc).__name__, None
 
     return None, None, None
 
@@ -273,6 +267,8 @@ class LoggingManager:
         """Attach app/debug handlers to the true root logger once."""
         root_logger = logging.getLogger()
         root_logger.setLevel(logging.DEBUG)
+        for logger_name in _THIRD_PARTY_DEBUG_CLAMP:
+            logging.getLogger(logger_name).setLevel(logging.INFO)
 
         if not _has_file_handler(root_logger, self.app_log_path):
             app_handler = RotatingFileHandler(

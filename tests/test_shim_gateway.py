@@ -41,6 +41,19 @@ def test_gateway_proxy_shim_reads_env_at_request_time(monkeypatch: pytest.Monkey
     captured = {"verify": None, "init_payload": None, "chat_url": None}
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/health":
+            return httpx.Response(
+                200,
+                json={
+                    "package": {
+                        "contracts": [
+                            "credential-refresh-v1",
+                            "autonomous-operator-messages-v1",
+                            "control-chat-continuation-v1",
+                        ],
+                    },
+                },
+            )
         if request.url.path == "/api/chat/init":
             captured["init_payload"] = json.loads(request.content.decode("utf-8"))
             return httpx.Response(200, json={"session_token": "token-1"})
@@ -78,6 +91,7 @@ def test_gateway_proxy_shim_reads_env_at_request_time(monkeypatch: pytest.Monkey
     assert captured["init_payload"] == {
         "api_key": "env-api-key",
         "user_id": "101",
+        "user_email": "test@example.com",
         "context": {"channel": "web"},
     }
     assert captured["chat_url"] == "http://gateway.from.env/api/chat"
@@ -89,6 +103,19 @@ def test_gateway_proxy_shim_create_http_client_is_monkeypatchable(
     captured = {"factory_called": False}
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/health":
+            return httpx.Response(
+                200,
+                json={
+                    "package": {
+                        "contracts": [
+                            "credential-refresh-v1",
+                            "autonomous-operator-messages-v1",
+                            "control-chat-continuation-v1",
+                        ],
+                    },
+                },
+            )
         if request.url.path == "/api/chat/init":
             return httpx.Response(200, json={"session_token": "token-1"})
         if request.url.path == "/api/chat":

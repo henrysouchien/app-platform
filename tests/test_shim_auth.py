@@ -73,3 +73,53 @@ def test_build_dev_user_supports_mapping_rows(monkeypatch):
         "google_user_id": "dev_hc@henrychien.com",
         "sub": "dev_hc@henrychien.com",
     }
+
+
+def test_dev_auth_bypass_preserves_memory_fallback_under_strict_database_mode(monkeypatch):
+    import services.auth_service as auth_module
+
+    @contextmanager
+    def _broken_db_session():
+        raise OSError(5, "Input/output error")
+        yield
+
+    monkeypatch.setattr(auth_module, "STRICT_DATABASE_MODE", True)
+    monkeypatch.setattr(auth_module, "_IS_PRODUCTION", False)
+    monkeypatch.setattr(auth_module, "DEV_AUTH_BYPASS", True)
+    monkeypatch.setattr(auth_module, "GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setattr(auth_module, "DEV_AUTH_EMAIL", "dev@example.com")
+    monkeypatch.setattr(auth_module, "get_db_session", _broken_db_session)
+
+    service = auth_module.AuthService(use_database=True)
+    session_id = service.create_user_session(
+        {
+            "user_id": "dev-user",
+            "google_user_id": "dev-user",
+            "email": "dev@example.com",
+            "name": "Dev User",
+        }
+    )
+
+    resolved_user = service.get_user_by_session(session_id)
+
+    assert service.strict_mode is False
+    assert resolved_user == {
+        "user_id": "dev-user",
+        "google_user_id": "dev-user",
+        "email": "dev@example.com",
+        "name": "Dev User",
+        "tier": "registered",
+    }
+
+
+def test_strict_database_mode_stays_strict_for_real_auth(monkeypatch):
+    import services.auth_service as auth_module
+
+    monkeypatch.setattr(auth_module, "STRICT_DATABASE_MODE", True)
+    monkeypatch.setattr(auth_module, "_IS_PRODUCTION", False)
+    monkeypatch.setattr(auth_module, "DEV_AUTH_BYPASS", False)
+    monkeypatch.setattr(auth_module, "GOOGLE_CLIENT_ID", "client-id")
+
+    service = auth_module.AuthService(use_database=True)
+
+    assert service.strict_mode is True

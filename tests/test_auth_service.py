@@ -407,7 +407,7 @@ def test_delete_session_uses_fallback_only_on_primary_exception():
     assert fallback_session_store.delete_calls == ["session-4"]
 
 
-def test_delete_session_returns_false_in_strict_mode_when_primary_raises():
+def test_delete_session_raises_authentication_error_in_strict_mode_when_primary_raises():
     primary_session_store = SimpleSessionStore(delete_error=RuntimeError("db down"))
     fallback_session_store = SimpleSessionStore(delete_result=True)
     service = AuthServiceBase(
@@ -418,9 +418,10 @@ def test_delete_session_returns_false_in_strict_mode_when_primary_raises():
         fallback_user_store=SimpleUserStore(),
     )
 
-    deleted = service.delete_session("session-5")
+    with pytest.raises(AuthenticationError, match="Primary session deletion failed"):
+        service.delete_session("session-5")
 
-    assert deleted is False
+    assert primary_session_store.delete_calls == ["session-5"]
     assert fallback_session_store.delete_calls == []
 
 

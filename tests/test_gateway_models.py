@@ -12,6 +12,22 @@ def test_gateway_chat_request_defaults_context_metadata_and_model() -> None:
     assert payload.context == {}
     assert payload.metadata == {}
     assert payload.model is None
+    assert payload.ui_blocks_contract is None
+
+
+def test_gateway_chat_request_round_trips_ui_blocks_contract() -> None:
+    payload = GatewayChatRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "ui_blocks_contract": {
+                "contract_version": 1,
+            },
+        }
+    )
+
+    assert payload.model_dump()["ui_blocks_contract"] == {
+        "contract_version": 1,
+    }
 
 
 def test_gateway_tool_approval_request_allows_optional_allow_tool_type() -> None:

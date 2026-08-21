@@ -82,6 +82,9 @@ def test_core_json_emission_uses_context_and_text_sink(tmp_path):
     assert rows[-1]["correlation_id"] == "corr-123"
     assert rows[-1]["details"]["step"] == "decode"
     assert rows[-1]["exception_type"] == "ValueError"
+    assert rows[-1]["error"] is None
+    assert rows[-1]["traceback"] is None
+    assert "bad token" not in Path(manager.errors_log_path).read_text()
 
     app_log_text = Path(manager.app_log_path).read_text()
     assert "[audit] user login" in app_log_text
@@ -120,6 +123,36 @@ def test_log_alert_deduplicates_and_rolls_up_after_window(tmp_path, monkeypatch)
     assert len(rows) == 2
     assert rows[0]["suppressed_count"] == 0
     assert rows[1]["suppressed_count"] == 2
+
+
+def test_third_party_debug_loggers_are_clamped(tmp_path, request):
+    core = importlib.import_module("app_platform.logging.core")
+    logger_names = (*core._THIRD_PARTY_DEBUG_CLAMP, "botocore.parsers")
+    original_levels = {name: logging.getLogger(name).level for name in logger_names}
+
+    def restore_levels():
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+    request.addfinalizer(restore_levels)
+    for name in logger_names:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    manager = core.configure_logging(
+        app_name="platform_app",
+        log_dir=str(tmp_path / "logs"),
+        environment="development",
+    )
+
+    assert logging.getLogger("botocore").getEffectiveLevel() >= logging.INFO
+    assert logging.getLogger("botocore.parsers").getEffectiveLevel() >= logging.INFO
+
+    marker = "debug clamp marker"
+    logging.getLogger("botocore.parsers").debug(marker)
+    _flush_manager(manager)
+
+    debug_log_text = Path(manager.debug_log_path).read_text()
+    assert marker not in debug_log_text
 
 
 def test_get_logger_lazy_auto_configures_with_warning(monkeypatch, tmp_path):

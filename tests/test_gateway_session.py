@@ -72,6 +72,80 @@ def test_gateway_session_manager_caches_tokens_per_user_key() -> None:
     asyncio.run(run())
 
 
+def test_gateway_session_manager_single_flights_concurrent_cold_cache() -> None:
+    manager = GatewaySessionManager()
+    calls = {"init": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["init"] += 1
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            results = await asyncio.gather(
+                *[
+                    manager.get_token(
+                        user_key="user-1",
+                        client=client,
+                        api_key_fn=lambda: "api-key",
+                        gateway_url_fn=lambda: "http://gateway.local",
+                    )
+                    for _ in range(5)
+                ]
+            )
+
+            assert results == ["token-1"] * 5
+            assert manager.lookup_token("user-1") == "token-1"
+            assert calls["init"] == 1
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_gateway_session_manager_single_flights_concurrent_force_refresh() -> None:
+    manager = GatewaySessionManager()
+    calls = {"init": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["init"] += 1
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            first = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+            )
+            results = await asyncio.gather(
+                *[
+                    manager.get_token(
+                        user_key="user-1",
+                        client=client,
+                        api_key_fn=lambda: "api-key",
+                        gateway_url_fn=lambda: "http://gateway.local",
+                        force_refresh=True,
+                    )
+                    for _ in range(5)
+                ]
+            )
+
+            assert first == "token-1"
+            assert results == ["token-2"] * 5
+            assert manager.lookup_token("user-1") == "token-2"
+            assert calls["init"] == 2
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
+
+
 def test_gateway_session_manager_accepts_custom_token_store() -> None:
     store = FalsyTokenStore()
     manager = GatewaySessionManager(token_store=store)
@@ -126,6 +200,105 @@ def test_gateway_session_manager_conversation_locks_are_independent() -> None:
         assert thread_one is thread_one_again
         assert thread_one is not thread_two
         assert per_user is not thread_one
+
+    asyncio.run(run())
+
+
+def test_gateway_session_manager_evicts_idle_ephemeral_state_but_keeps_held_locks() -> None:
+    manager = GatewaySessionManager(max_session_state_entries=3)
+    calls = {"init": 0}
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls["init"] += 1
+        return httpx.Response(200, json={"session_token": f"token-{calls['init']}"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        default_lock = await manager.get_stream_lock("user-1")
+        held_lock = await manager.get_stream_lock("user-1", "held")
+        await default_lock.acquire()
+        await held_lock.acquire()
+        try:
+            default_token = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+            )
+            held_token = await manager.get_token(
+                user_key="user-1",
+                client=client,
+                api_key_fn=lambda: "api-key",
+                gateway_url_fn=lambda: "http://gateway.local",
+                conversation_id="held",
+            )
+
+            for conversation_id in ("idle-1", "idle-2", "idle-3"):
+                await manager.get_stream_lock("user-1", conversation_id)
+                await manager.get_token(
+                    user_key="user-1",
+                    client=client,
+                    api_key_fn=lambda: "api-key",
+                    gateway_url_fn=lambda: "http://gateway.local",
+                    conversation_id=conversation_id,
+                )
+
+            assert default_token == "token-1"
+            assert held_token == "token-2"
+            assert manager.lookup_token("user-1") == "token-1"
+            assert manager.lookup_token("user-1", "held") == "token-2"
+            assert manager.lookup_token("user-1", "idle-1") is None
+            assert manager.lookup_token("user-1", "idle-2") is None
+            assert manager.lookup_token("user-1", "idle-3") == "token-5"
+            assert set(manager._consumer_hashes) == {
+                "user-1",
+                "user-1:t:held",
+                "user-1:t:idle-3",
+            }
+            assert set(manager._token_locks) == {
+                "user-1",
+                "user-1:t:held",
+                "user-1:t:idle-3",
+            }
+            assert set(manager._stream_locks) == {
+                "user-1",
+                "user-1:t:held",
+                "user-1:t:idle-3",
+            }
+            assert manager._stream_locks["user-1"].locked()
+            assert manager._stream_locks["user-1:t:held"].locked()
+        finally:
+            if held_lock.locked():
+                held_lock.release()
+            if default_lock.locked():
+                default_lock.release()
+            await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_gateway_session_manager_keeps_new_stream_lock_when_all_old_locks_are_held() -> None:
+    manager = GatewaySessionManager(max_session_state_entries=2)
+
+    async def run() -> None:
+        default_lock = await manager.get_stream_lock("user-1")
+        held_lock = await manager.get_stream_lock("user-1", "held")
+        await default_lock.acquire()
+        await held_lock.acquire()
+        try:
+            pending_lock = await manager.get_stream_lock("user-1", "pending")
+
+            assert manager._stream_locks["user-1:t:pending"] is pending_lock
+            assert set(manager._stream_locks) == {
+                "user-1",
+                "user-1:t:held",
+                "user-1:t:pending",
+            }
+        finally:
+            if held_lock.locked():
+                held_lock.release()
+            if default_lock.locked():
+                default_lock.release()
 
     asyncio.run(run())
 
@@ -457,6 +630,35 @@ def test_init_structured_error_credentials_timeout() -> None:
 
         assert exc_info.value.status_code == 504
         assert exc_info.value.detail == {"error": "credentials_timeout", "timeout_seconds": 5.0}
+
+    asyncio.run(run())
+
+
+def test_init_structured_error_auth_failed() -> None:
+    manager = GatewaySessionManager()
+    error_body = {
+        "error": "auth_failed",
+        "message": "Web-channel credential resolver not configured",
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json=error_body)
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                await manager._initialize_session(
+                    client=client,
+                    api_key="api-key",
+                    gateway_url="http://gateway.local",
+                    user_id="u1",
+                )
+        finally:
+            await client.aclose()
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == error_body
 
     asyncio.run(run())
 

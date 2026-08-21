@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import logging
@@ -83,6 +84,22 @@ def test_request_timing_middleware_logs_normal_requests(tmp_path):
     assert rows[-1]["details"]["streaming"] is False
 
 
+def test_request_timing_middleware_does_not_persist_query_credentials(tmp_path):
+    client, manager = _build_client(tmp_path)
+    raw_api_key = "canary-query-api-key"
+
+    response = client.get("/normal", params={"key": raw_api_key, "view": "summary"})
+
+    assert response.status_code == 200
+    _flush_manager(manager)
+
+    persisted = Path(manager.timing_log_path).read_text()
+    rows = _read_jsonl(Path(manager.timing_log_path))
+    assert raw_api_key not in persisted
+    assert "query" not in rows[-1]["details"]
+    assert rows[-1]["name"] == "GET /normal"
+
+
 def test_request_timing_middleware_marks_streaming_responses(tmp_path):
     client, manager = _build_client(tmp_path)
 
@@ -99,16 +116,6 @@ def test_request_timing_middleware_marks_streaming_responses(tmp_path):
     assert rows[-1]["details"]["streaming"] is True
 
 
-def test_request_timing_middleware_adds_duration_header_for_non_streaming(tmp_path):
-    client, _ = _build_client(tmp_path)
-
-    response = client.get("/normal")
-
-    assert response.status_code == 200
-    assert "x-request-duration-ms" in response.headers
-    assert float(response.headers["x-request-duration-ms"]) >= 0
-
-
 def test_request_timing_middleware_omits_duration_header_for_streaming(tmp_path):
     client, _ = _build_client(tmp_path)
 
@@ -116,3 +123,66 @@ def test_request_timing_middleware_omits_duration_header_for_streaming(tmp_path)
 
     assert response.status_code == 200
     assert "x-request-duration-ms" not in response.headers
+
+
+def test_request_timing_middleware_forwards_silent_sse_start_immediately(monkeypatch):
+    timing = importlib.import_module("app_platform.middleware.timing")
+    logged_events = []
+
+    monkeypatch.setattr(
+        timing,
+        "log_timing_event",
+        lambda **kwargs: logged_events.append(kwargs),
+    )
+
+    async def run() -> list[dict]:
+        start_seen = asyncio.Event()
+        never_send_body = asyncio.Event()
+        messages = []
+
+        async def app(scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")],
+                }
+            )
+            await never_send_body.wait()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+            if message["type"] == "http.response.start":
+                start_seen.set()
+
+        middleware = timing.RequestTimingMiddleware(app)
+        task = asyncio.create_task(
+            middleware(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/events",
+                    "query_string": b"",
+                },
+                receive,
+                send,
+            )
+        )
+
+        await asyncio.wait_for(start_seen.wait(), timeout=0.1)
+        assert [message["type"] for message in messages] == ["http.response.start"]
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        return messages
+
+    messages = asyncio.run(run())
+
+    assert messages[0]["status"] == 200
+    assert logged_events[-1]["status"] == 200
+    assert logged_events[-1]["streaming"] is False

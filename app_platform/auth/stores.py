@@ -10,6 +10,11 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _is_dev_placeholder(value: Any) -> bool:
+    candidate = str(value or "").strip()
+    return candidate.startswith("dev_") and "@" in candidate[4:]
+
+
 class PostgresSessionStore:
     """SessionStore backed by the ``user_sessions`` table."""
 
@@ -188,11 +193,19 @@ class PostgresUserStore:
                 existing_user = self._find_user_by_email(cursor, email)
 
             if existing_user is not None:
+                existing_google_user_id = existing_user["google_user_id"]
+                resolved_provider_user_id = provider_user_id
+                if (
+                    _is_dev_placeholder(provider_user_id)
+                    and existing_google_user_id
+                    and not _is_dev_placeholder(existing_google_user_id)
+                ):
+                    resolved_provider_user_id = existing_google_user_id
                 self._update_existing_user(
                     conn,
                     cursor,
                     existing_user["id"],
-                    provider_user_id,
+                    resolved_provider_user_id,
                     email,
                     name,
                 )
@@ -201,8 +214,8 @@ class PostgresUserStore:
                     "name": name if name is not None else existing_user["name"],
                     "tier": existing_user["tier"],
                     "google_user_id": (
-                        provider_user_id
-                        if provider_user_id is not None
+                        resolved_provider_user_id
+                        if resolved_provider_user_id is not None
                         else existing_user["google_user_id"]
                     ),
                 }

@@ -26,21 +26,40 @@ class GoogleTokenVerifier:
             "google_user_id": "dev_google_123",
         }
 
-    def verify(self, token: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    def verify_claims(
+        self,
+        token: str,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Verify a Google ID token and return its claims."""
         try:
             if self.dev_mode or not self.client_id:
-                return dict(self.dev_user), None
+                claims = dict(self.dev_user)
+                claims.setdefault("sub", claims.get("google_user_id"))
+                return claims, None
 
             id_info = id_token.verify_oauth2_token(
                 token,
                 google_requests.Request(),
                 self.client_id,
             )
+            return dict(id_info), None
+
+        except Exception as exc:
+            return None, f"Google token verification failed: {exc}"
+
+    def verify(self, token: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+        claims, error = self.verify_claims(token)
+        if error or claims is None:
+            return None, error
+        if self.dev_mode or not self.client_id:
+            return dict(self.dev_user), None
+
+        try:
             return {
-                "user_id": id_info["sub"],
-                "email": id_info["email"],
-                "name": id_info.get("name", ""),
-                "google_user_id": id_info["sub"],
+                "user_id": claims["sub"],
+                "email": claims["email"],
+                "name": claims.get("name", ""),
+                "google_user_id": claims["sub"],
             }, None
 
         except Exception as exc:

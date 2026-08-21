@@ -204,6 +204,8 @@ class AuthServiceBase:
 
             return self.fallback_session_store.delete_session(session_id)
 
+        except AuthenticationError:
+            raise
         except Exception:
             return False
 

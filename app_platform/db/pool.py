@@ -18,10 +18,12 @@ class PoolManager:
         database_url=None,
         min_connections=None,
         max_connections=None,
+        application_name=None,
     ):
         self._database_url = database_url
         self._min_connections = min_connections
         self._max_connections = max_connections
+        self._application_name = application_name
         self._pool = None
         self._pool_lock = threading.Lock()
 
@@ -45,6 +47,12 @@ class PoolManager:
             value = os.getenv("DB_POOL_MAX", "10")
         return int(value)
 
+    @property
+    def application_name(self):
+        if self._application_name:
+            return self._application_name
+        return os.getenv("DB_APPLICATION_NAME", "").strip()
+
     def get_pool(self):
         if self._pool is None:
             with self._pool_lock:
@@ -60,11 +68,18 @@ class PoolManager:
                             "DB_POOL_MIN cannot be greater than DB_POOL_MAX"
                         )
 
+                    connection_kwargs = {
+                        "cursor_factory": psycopg2.extras.RealDictCursor,
+                    }
+                    application_name = self.application_name
+                    if application_name:
+                        connection_kwargs["application_name"] = application_name
+
                     self._pool = ThreadedConnectionPool(
                         min_connections,
                         max_connections,
                         database_url,
-                        cursor_factory=psycopg2.extras.RealDictCursor,
+                        **connection_kwargs,
                     )
         return self._pool
 

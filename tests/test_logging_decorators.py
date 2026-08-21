@@ -55,7 +55,8 @@ def test_log_errors_reraises_and_logs_structured_error(tmp_path):
 
     _flush_manager(manager)
     rows = _read_jsonl(Path(manager.errors_log_path))
-    assert any(row["message"] == "failing_async failed: RuntimeError: boom" for row in rows)
+    assert any(row["message"] == "failing_async failed" for row in rows)
+    assert "boom" not in Path(manager.errors_log_path).read_text()
     assert rows[-1]["severity"] == "high"
 
 

@@ -52,6 +52,35 @@ def test_pool_manager_uses_constructor_args(monkeypatch):
     assert "cursor_factory" in pool.kwargs
 
 
+def test_pool_manager_passes_application_name(monkeypatch):
+    pool_module = importlib.import_module("app_platform.db.pool")
+    monkeypatch.setattr(pool_module, "ThreadedConnectionPool", FakeConnectionPool)
+
+    manager = pool_module.PoolManager(
+        database_url="postgresql://explicit/db",
+        min_connections=0,
+        max_connections=3,
+        application_name="risk_module:portfolio-reads-mcp:123",
+    )
+
+    pool = manager.get_pool()
+
+    assert pool.minconn == 0
+    assert pool.maxconn == 3
+    assert pool.kwargs["application_name"] == "risk_module:portfolio-reads-mcp:123"
+
+
+def test_pool_manager_reads_application_name_environment(monkeypatch):
+    pool_module = importlib.import_module("app_platform.db.pool")
+    monkeypatch.setattr(pool_module, "ThreadedConnectionPool", FakeConnectionPool)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://env/default")
+    monkeypatch.setenv("DB_APPLICATION_NAME", "risk_module:research-mcp:456")
+
+    pool = pool_module.PoolManager().get_pool()
+
+    assert pool.kwargs["application_name"] == "risk_module:research-mcp:456"
+
+
 def test_pool_manager_reads_environment_defaults(monkeypatch):
     pool_module = importlib.import_module("app_platform.db.pool")
     monkeypatch.setattr(pool_module, "ThreadedConnectionPool", FakeConnectionPool)
