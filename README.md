@@ -5,12 +5,16 @@ Generic web app infrastructure for PostgreSQL pooling, structured logging, auth,
 ## Installation
 
 ```bash
-pip install app-platform
 pip install "app-platform[all]"
 pip install "app-platform[fastapi]"
-pip install "app-platform[auth-google]"
-pip install "app-platform[gateway]"
+pip install "app-platform[fastapi,auth-google]"
+pip install "app-platform[fastapi,gateway]"
 ```
+
+`import app_platform` eagerly re-exports `db`, `logging`, and `middleware`, and
+`middleware` is FastAPI-side, so the `fastapi` extra is the minimum supported
+install. A bare `pip install app-platform` installs the package without those
+runtime dependencies and is not a supported configuration.
 
 ## Included subpackages
 

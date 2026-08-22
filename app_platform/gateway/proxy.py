@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from pydantic_core import core_schema
 
-from app_platform.auth.dependencies import TIER_ORDER
+from app_platform.auth.dependencies import TIER_ORDER, resolve_user_tier
 from .control_run_lifecycle import (
     is_control_chat_messageable_state,
     is_control_run_state,
@@ -207,7 +207,7 @@ def _get_user_key(user: dict[str, Any]) -> str:
 def _require_min_chat_tier(user: dict[str, Any], config: GatewayConfig) -> str:
     """Require the same paid-tier floor for every gateway-backed AI surface."""
 
-    user_tier = str(user.get("tier") or "registered").strip().lower() or "registered"
+    user_tier = resolve_user_tier(user)
     if TIER_ORDER.get(user_tier, 0) < TIER_ORDER[config.min_chat_tier]:
         raise HTTPException(
             status_code=403,

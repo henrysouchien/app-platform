@@ -89,7 +89,6 @@ def build_validation_error_handler(
             include_input_value=expose_details,
             redact_input_value=True,
         )
-        raw_body_logged = False
 
         if log_details:
             try:
@@ -133,7 +132,6 @@ def build_validation_error_handler(
                     "validation_details": validation_details,
                     "endpoint": str(request.url.path),
                     "method": request.method,
-                    "raw_body_logged": raw_body_logged,
                 }
             ),
         )

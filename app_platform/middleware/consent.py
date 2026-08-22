@@ -25,28 +25,11 @@ class ConsentEnforcementMiddleware:
         self,
         app: ASGIApp,
         *,
-        auth_service: Any | None = None,
-        session_factory: Callable[[], Any] | None = None,
-        consent_checker: Callable[..., bool] | None = None,
+        auth_service: Any,
+        session_factory: Callable[[], Any],
+        consent_checker: Callable[..., bool],
     ) -> None:
         self.app = app
-        if auth_service is None:
-            from services.auth_service import auth_service as default_auth_service
-
-            auth_service = default_auth_service
-        if session_factory is None:
-            from database import get_db_session
-
-            session_factory = get_db_session
-        if consent_checker is None:
-            from services.user_consents import GENERAL_DOCUMENT_TYPES, has_current_consent
-
-            def consent_checker(conn: Any, *, user_id: int) -> bool:
-                return all(
-                    has_current_consent(conn, user_id=user_id, document_type=document_type)
-                    for document_type in GENERAL_DOCUMENT_TYPES
-                )
-
         self.auth_service = auth_service
         self.session_factory = session_factory
         self.consent_checker = consent_checker

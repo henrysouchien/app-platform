@@ -38,15 +38,39 @@ auth-google = [
 gateway = [
     "httpx>=0.24,<1",
     "fastapi>=0.100,<1",
+    "pydantic>=2,<3",
+    "pydantic-core>=2,<3",
+    "PyJWT>=2.8,<3",
+    "cryptography>=41",
 ]
-api-budget = [
-    "redis>=5.0,<6",
-]
-all = ["app-platform[fastapi,auth-google,gateway,api-budget]"]
+all = ["app-platform[fastapi,auth-google,gateway]"]
 
 [project.urls]
 Homepage = "https://github.com/henrysouchien/app-platform"
 Repository = "https://github.com/henrysouchien/app-platform"
 
-[tool.hatchling.build]
-packages = ["app_platform"]
+# The published surface of app-platform.
+# This table is the ONLY declaration of what ships. scripts/sync_app_platform.sh
+# and the hatchling build both derive the file set from it; README.md documents
+# the same surface by hand and is held to this table by
+# tests/app_platform/test_distribution_contract.py.
+# It sits under [tool.hatch.build] rather than a per-target table so it governs
+# every artifact hatchling emits -- publish uploads the sdist as well as the
+# wheel, and a table scoped to one target would leave the other undeclared.
+# Paths are relative to the distribution root, i.e. the dist repo root, where
+# scripts/sync_app_platform.sh copies this file.
+# Membership is directory-granular: a new top-level member requires an edit
+# here, while a new file inside a declared directory ships automatically. What
+# such a file may import -- from this repository or from a distribution that
+# [project] does not declare -- is governed by
+# tests/test_architecture_boundaries.py.
+[tool.hatch.build]
+only-include = [
+    "app_platform/__init__.py",
+    "app_platform/py.typed",
+    "app_platform/auth",
+    "app_platform/db",
+    "app_platform/gateway",
+    "app_platform/logging",
+    "app_platform/middleware",
+]
