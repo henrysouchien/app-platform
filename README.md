@@ -26,6 +26,11 @@ runtime dependencies and is not a supported configuration.
 | `auth` | Pluggable auth service base with in-memory and PostgreSQL-backed user/session stores |
 | `gateway` | FastAPI router factory for proxying chat and tool approval requests to an upstream gateway |
 
+Risk application assembly lives separately in `risk_app/` at the monorepo root:
+app factories and route adapters, commercial policy, and provider-budget controls
+are application code, not part of this distribution. The published `app_platform`
+namespace contains only the library members above and its package metadata.
+
 ## Quick usage
 
 ### Database
@@ -121,6 +126,33 @@ gateway_router = create_gateway_router(
 
 app.include_router(gateway_router, prefix="/gateway")
 ```
+
+The proxy is the cookie-authenticated edge: `get_current_user` supplies the
+authoritative user identity, and the proxy enforces that identity and the web
+channel upstream. Browser-supplied bearer credentials are not forwarded. Gateway
+SSE bytes pass through unchanged, with bare heartbeat frames added while idle;
+the proxy does not parse chat events or implement another chat client library.
+
+`GatewaySessionManager` holds a bounded warm cache per user and, when supplied,
+per conversation. Init alone does not establish conversation continuity: the
+first chat POST accepted with HTTP 200 records that POST's session id as the log
+identity. Later bearer refreshes present this opening id as `resume_session_id`,
+not the newer session ids returned by resumed inits. A chat POST rejected for an
+expired session is retried once with the same payload. Subscribe, cancel, and
+approval requests are session-bound and are never replayed on a new session;
+subscribe/cancel authentication failures invalidate the bearer while keeping the
+opening log id for the next new chat turn. Approval failures return directly,
+and the next chat can refresh if its bearer is rejected.
+An init overlapping the opening POST is reconciled with that accepted log
+before its bearer can be reused for another turn. If the competing init already
+completed, acceptance invalidates its incompatible bearer; if it is still pending,
+it completes by resuming the newly established log. Reset and eviction retire the
+conversation, so delayed acceptance cannot restore it.
+
+Continuity is warm-cache-only, not durable proxy storage. Process restart,
+explicit reset, or idle cache eviction loses the held log identity; a later turn
+starts a new conversation. If the gateway refuses a held resume identity, the
+manager logs the continuity loss and initializes without it.
 
 ## Requirements
 

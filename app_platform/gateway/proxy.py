@@ -11,16 +11,16 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from pydantic_core import core_schema
+from starlette.types import Receive, Scope, Send
 
-from app_platform.auth.dependencies import TIER_ORDER, resolve_user_tier
 from .control_run_lifecycle import (
     is_control_chat_messageable_state,
     is_control_run_state,
@@ -46,15 +46,17 @@ from .models import (
     GatewayChatRequest,
     GatewayModelPreferenceResponse,
     GatewayModelPreferenceUpdate,
+    GatewayModelPresetResponse,
+    GatewayModelPresetUpdate,
     GatewayToolApprovalRequest,
 )
 from .session import GatewaySessionManager
 
 logger = logging.getLogger(__name__)
+_PreferenceDoorResponseT = TypeVar("_PreferenceDoorResponseT", bound=BaseModel)
 _RESERVED_HEADERS = frozenset({"authorization"})
 _KNOWN_UPSTREAM_ERRORS = frozenset(
     {
-        "auth_expired",
         "cross_user_reuse",
         "missing_user_id",
         "strict_mode_default_user",
@@ -127,18 +129,12 @@ class GatewayConfig:
     context_enricher: Callable[[Any, Any, dict[str, Any]], dict[str, Any]] | None = None
     dispatch_scope_validator: Callable[[Request, dict[str, Any], dict[str, Any]], Any] | None = None
     fail_on_context_enricher_error: bool = False
-    min_chat_tier: str = "paid"
     required_contracts: frozenset[str] = field(default_factory=frozenset)
     contract_check_ttl_seconds: float = 300.0
     required_control_plane_version: str | None = "1"
     control_chat_continuation_contract: str | None = None
 
     def __post_init__(self) -> None:
-        self.min_chat_tier = str(self.min_chat_tier or "paid").strip().lower() or "paid"
-        if self.min_chat_tier not in TIER_ORDER:
-            raise ValueError(
-                f"Invalid min_chat_tier={self.min_chat_tier!r}; must be one of {sorted(TIER_ORDER)}"
-            )
         if self.required_control_plane_version is not None:
             normalized_version = str(self.required_control_plane_version).strip()
             self.required_control_plane_version = normalized_version or None
@@ -202,23 +198,6 @@ def _get_user_key(user: dict[str, Any]) -> str:
             detail="Invalid user identity (user_id missing — auth middleware bug)",
         )
     return str(user_id)
-
-
-def _require_min_chat_tier(user: dict[str, Any], config: GatewayConfig) -> str:
-    """Require the same paid-tier floor for every gateway-backed AI surface."""
-
-    user_tier = resolve_user_tier(user)
-    if TIER_ORDER.get(user_tier, 0) < TIER_ORDER[config.min_chat_tier]:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "upgrade_required",
-                "message": f"AI chat requires a {config.min_chat_tier} subscription.",
-                "tier_required": config.min_chat_tier,
-                "tier_current": user_tier,
-            },
-        )
-    return user_tier
 
 
 def _explicit_conversation_id(context: Any) -> str | None:
@@ -312,9 +291,28 @@ def _build_gateway_chat_payload(
     return payload
 
 
+class _OwnedStreamingResponse(StreamingResponse):
+    """Stream response that releases its route's resources even if never iterated.
+
+    The body generator's ``finally`` cannot run when the client is gone before
+    the first chunk is requested, so the response itself owns the release.
+    """
+
+    def __init__(self, content: Any, *, release: Callable[[], Awaitable[None]], **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._release = release
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._release()
+
+
 # The shared upstream client disables the read timeout for SSE bodies, so the
 # wait for stream-open response headers must be bounded separately — otherwise a
-# non-responding gateway parks the request forever with the user stream lock held.
+# non-responding gateway parks the request forever, its conversation's session
+# state counted as an active stream and so held out of idle eviction.
 _STREAM_OPEN_TIMEOUT_SECONDS = 30.0
 
 
@@ -357,7 +355,7 @@ async def _open_gateway_chat_stream(
 
 # Error bodies ride the same read=None client as SSE streams; a gateway that
 # sends error headers but stalls the body would otherwise hold the request (and
-# the user stream lock) indefinitely.
+# its active-stream count, which pins the session state) indefinitely.
 _ERROR_BODY_READ_TIMEOUT_SECONDS = 10.0
 
 
@@ -439,9 +437,17 @@ def create_gateway_router(
     get_current_user: Callable[..., Any],
     http_client_factory: Optional[Callable[[], httpx.AsyncClient]] = None,
     *,
+    get_paid_user: Optional[Callable[..., Any]] = None,
     session_manager: Optional[GatewaySessionManager] = None,
 ) -> APIRouter:
-    """Create a gateway proxy router with injected config and auth."""
+    """Create a gateway proxy router with injected config and auth.
+
+    ``get_paid_user`` is the injected dependency for the AI chat, control, artifact
+    and preference routes; when omitted those routes use ``get_current_user``.
+    Used as a FastAPI dependency; zero-argument callables work.
+    """
+    if get_paid_user is None:
+        get_paid_user = get_current_user
 
     router = APIRouter(tags=["gateway-proxy"])
     session_manager = session_manager if session_manager is not None else GatewaySessionManager()
@@ -570,7 +576,7 @@ def create_gateway_router(
         payload: _GatewayChatRequestOpenAPIBody = Body(...),
     ) -> GatewayChatRequest:
         try:
-            return GatewayChatRequest.model_validate(payload)
+            chat_request = GatewayChatRequest.model_validate(payload)
         except ValidationError as exc:
             errors = exc.errors(include_input=False, include_url=False)
             messages = tuple(str(error.get("msg") or "") for error in errors)
@@ -643,6 +649,20 @@ def create_gateway_router(
                 status_code=status_code,
                 detail=detail,
             ) from exc
+
+        # Normalizer-only purposes are refused here, after model validation and
+        # before the injected tier dependency (declared after this one) runs.
+        context = chat_request.context or {}
+        purpose = str(context.get("purpose") or "chat").strip().lower() or "chat"
+        if purpose == "normalizer":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "chat_purpose_unavailable",
+                    "message": "The requested chat purpose is not available.",
+                },
+            )
+        return chat_request
 
     def _user_email(user: dict[str, Any]) -> str | None:
         raw_user_email = user.get("email")
@@ -2156,15 +2176,18 @@ def create_gateway_router(
         finally:
             await client.aclose()
 
-    async def _proxy_model_preference(
+    async def _proxy_preference_door(
         *,
         method: str,
         user: dict[str, Any],
-        update: GatewayModelPreferenceUpdate | None = None,
-    ) -> GatewayModelPreferenceResponse:
-        """Use this user's chat bearer for account preference authority."""
+        path: str,
+        body: dict[str, Any] | None,
+        response_model: type[_PreferenceDoorResponseT],
+        error_prefix: str,
+        subject: str,
+    ) -> _PreferenceDoorResponseT:
+        """Use this user's chat bearer for account preference and preset authority."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         raw_user_email = user.get("email")
         user_email = (
@@ -2188,13 +2211,9 @@ def create_gateway_router(
             while True:
                 upstream = await client.request(
                     method,
-                    f"{gateway_url}/api/model-preferences/session.driver",
+                    f"{gateway_url}/api/{path}",
                     headers={"Authorization": f"Bearer {session_token}"},
-                    json=(
-                        update.model_dump(exclude_none=True)
-                        if update is not None
-                        else None
-                    ),
+                    json=body,
                     timeout=httpx.Timeout(10.0, read=20.0),
                 )
                 if upstream.status_code != 401 or retried:
@@ -2215,21 +2234,19 @@ def create_gateway_router(
                 raise HTTPException(
                     status_code=upstream.status_code,
                     detail={
-                        "error": "model_preference_rejected",
-                        "message": "The gateway rejected the model preference request.",
+                        "error": f"{error_prefix}_rejected",
+                        "message": f"The gateway rejected the {subject} request.",
                     },
                     headers={"Cache-Control": "private, no-store"},
                 )
             try:
-                preference = GatewayModelPreferenceResponse.model_validate(
-                    upstream.json()
-                )
+                preference = response_model.model_validate(upstream.json())
             except (ValueError, TypeError) as exc:
                 raise HTTPException(
                     status_code=502,
                     detail={
-                        "error": "model_preference_contract_invalid",
-                        "message": "Gateway returned an invalid model preference response.",
+                        "error": f"{error_prefix}_contract_invalid",
+                        "message": f"Gateway returned an invalid {subject} response.",
                     },
                 ) from exc
             session_manager.invalidate_token(user_key)
@@ -2238,20 +2255,52 @@ def create_gateway_router(
             raise HTTPException(
                 status_code=504,
                 detail={
-                    "error": "model_preference_timeout",
-                    "message": "Gateway model preference request timed out.",
+                    "error": f"{error_prefix}_timeout",
+                    "message": f"Gateway {subject} request timed out.",
                 },
             ) from exc
         except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "error": "model_preference_unavailable",
-                    "message": "Gateway model preference service is unavailable.",
+                    "error": f"{error_prefix}_unavailable",
+                    "message": f"Gateway {subject} service is unavailable.",
                 },
             ) from exc
         finally:
             await client.aclose()
+
+    async def _proxy_model_preference(
+        *,
+        method: str,
+        user: dict[str, Any],
+        update: GatewayModelPreferenceUpdate | None = None,
+    ) -> GatewayModelPreferenceResponse:
+        return await _proxy_preference_door(
+            method=method,
+            user=user,
+            path="model-preferences/session.driver",
+            body=update.model_dump(exclude_none=True) if update is not None else None,
+            response_model=GatewayModelPreferenceResponse,
+            error_prefix="model_preference",
+            subject="model preference",
+        )
+
+    async def _proxy_model_preset(
+        *,
+        method: str,
+        user: dict[str, Any],
+        update: GatewayModelPresetUpdate | None = None,
+    ) -> GatewayModelPresetResponse:
+        return await _proxy_preference_door(
+            method=method,
+            user=user,
+            path="model-presets/self",
+            body=update.model_dump() if update is not None else None,
+            response_model=GatewayModelPresetResponse,
+            error_prefix="model_preset",
+            subject="model preset",
+        )
 
     @router.put(
         "/model-preferences/session.driver",
@@ -2260,7 +2309,7 @@ def create_gateway_router(
     async def gateway_put_model_preference(
         update: GatewayModelPreferenceUpdate,
         response: Response,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ) -> GatewayModelPreferenceResponse:
         response.headers["Cache-Control"] = "private, no-store"
         return await _proxy_model_preference(method="PUT", user=user, update=update)
@@ -2271,10 +2320,35 @@ def create_gateway_router(
     )
     async def gateway_delete_model_preference(
         response: Response,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ) -> GatewayModelPreferenceResponse:
         response.headers["Cache-Control"] = "private, no-store"
         return await _proxy_model_preference(method="DELETE", user=user)
+
+    @router.get("/model-presets/self", response_model=GatewayModelPresetResponse)
+    async def gateway_get_model_preset(
+        response: Response,
+        user: dict[str, Any] = Depends(get_paid_user),
+    ) -> GatewayModelPresetResponse:
+        response.headers["Cache-Control"] = "private, no-store"
+        return await _proxy_model_preset(method="GET", user=user)
+
+    @router.put("/model-presets/self", response_model=GatewayModelPresetResponse)
+    async def gateway_put_model_preset(
+        update: GatewayModelPresetUpdate,
+        response: Response,
+        user: dict[str, Any] = Depends(get_paid_user),
+    ) -> GatewayModelPresetResponse:
+        response.headers["Cache-Control"] = "private, no-store"
+        return await _proxy_model_preset(method="PUT", user=user, update=update)
+
+    @router.delete("/model-presets/self", response_model=GatewayModelPresetResponse)
+    async def gateway_delete_model_preset(
+        response: Response,
+        user: dict[str, Any] = Depends(get_paid_user),
+    ) -> GatewayModelPresetResponse:
+        response.headers["Cache-Control"] = "private, no-store"
+        return await _proxy_model_preset(method="DELETE", user=user)
 
     @router.get(
         "/capability-choices/session.driver",
@@ -2282,11 +2356,10 @@ def create_gateway_router(
     )
     async def gateway_capability_choices(
         request: Request,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ) -> GatewayCapabilityChoicesResponse:
         """Return only this authenticated user's session-driver choices."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         raw_user_email = user.get("email")
         user_email = None
@@ -2328,11 +2401,10 @@ def create_gateway_router(
 
     @router.get("/capabilities")
     async def gateway_capabilities(
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ) -> GatewayCapabilitiesResponse:
         """Project browser-safe optional gateway capabilities."""
 
-        _require_min_chat_tier(user, config)
         client = _create_http_client()
         try:
             gateway_url = config.resolve_url()
@@ -2363,20 +2435,12 @@ def create_gateway_router(
     async def gateway_chat(
         request: Request,
         chat_request: GatewayChatRequest = Depends(_validated_gateway_chat_request),
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ):
         """Proxy web-channel chat stream to the gateway."""
 
         context = chat_request.context or {}
         purpose = str(context.get("purpose") or "chat").strip().lower() or "chat"
-        if purpose == "normalizer":
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "chat_purpose_unavailable",
-                    "message": "The requested chat purpose is not available.",
-                },
-            )
         conversation_id: str | None = None
         if purpose == "research_workspace":
             _thread_id = context.get("thread_id")
@@ -2384,30 +2448,32 @@ def create_gateway_router(
                 conversation_id = str(_thread_id).strip()
         if conversation_id is None:
             conversation_id = _explicit_conversation_id(context)
-        _require_min_chat_tier(user, config)
 
         user_key = _get_user_key(user)
         raw_user_email = user.get("email")
         user_email = None
         if raw_user_email is not None and str(raw_user_email).strip():
             user_email = str(raw_user_email).strip()
-        user_lock = await session_manager.get_stream_lock(user_key, conversation_id)
-        if user_lock.locked():
-            raise HTTPException(status_code=409, detail="A chat stream is already active")
-
-        await user_lock.acquire()
         client = _create_http_client()
         upstream_response: Optional[httpx.Response] = None
-        lock_released = False
+        # Concurrent turns are not refused here: gateway turn admission owns them.
+        # The count only keeps this conversation's session state out of eviction.
+        session_manager.begin_stream(user_key, conversation_id)
+        stream_ended = False
+        client_disconnected = False
 
         async def release_resources() -> None:
-            nonlocal lock_released
-            if upstream_response is not None:
-                await upstream_response.aclose()
-            await client.aclose()
-            if not lock_released and user_lock.locked():
-                user_lock.release()
-                lock_released = True
+            nonlocal stream_ended
+            try:
+                if upstream_response is not None:
+                    await upstream_response.aclose()
+                await client.aclose()
+            finally:
+                if not stream_ended:
+                    stream_ended = True
+                    session_manager.end_stream(
+                        user_key, conversation_id, abandoned=client_disconnected,
+                    )
 
         try:
             extra_headers: dict[str, str] = {}
@@ -2474,8 +2540,8 @@ def create_gateway_router(
             )
 
             session_expired_retried = False
-            auth_expired_retried = False
             while True:
+                post_session_id = session_manager.lookup_session_id(user_key, conversation_id)
                 upstream_response = await _open_gateway_chat_stream(
                     client=client,
                     gateway_url=gateway_url,
@@ -2485,6 +2551,11 @@ def create_gateway_router(
                 )
 
                 if upstream_response.status_code == 200:
+                    session_manager.mark_chat_accepted(
+                        user_key,
+                        session_id=post_session_id,
+                        conversation_id=conversation_id,
+                    )
                     break
 
                 error_code, _error_body, error_body_bytes = await _classify_upstream_error(upstream_response)
@@ -2496,27 +2567,6 @@ def create_gateway_router(
                     )
                     await upstream_response.aclose()
                     upstream_response = None
-                    session_token = await session_manager.get_token(
-                        user_key=user_key,
-                        client=client,
-                        api_key_fn=config.resolve_api_key,
-                        gateway_url_fn=config.resolve_url,
-                        force_refresh=True,
-                        conversation_id=conversation_id,
-                        channel=config.channel,
-                        user_email=user_email,
-                    )
-                    continue
-
-                if error_code == "auth_expired" and not auth_expired_retried:
-                    auth_expired_retried = True
-                    logger.info(
-                        "gateway chat retrying after auth_expired request_id=%s",
-                        request_id,
-                    )
-                    await upstream_response.aclose()
-                    upstream_response = None
-                    session_manager.invalidate_token(user_key, conversation_id)
                     session_token = await session_manager.get_token(
                         user_key=user_key,
                         client=client,
@@ -2543,15 +2593,13 @@ def create_gateway_router(
                 )
 
             async def event_stream():
-                _disconnected = False
-
                 async def _watch_disconnect() -> None:
-                    nonlocal _disconnected
+                    nonlocal client_disconnected
 
                     while True:
                         await asyncio.sleep(2)
                         if await request.is_disconnected():
-                            _disconnected = True
+                            client_disconnected = True
                             try:
                                 await asyncio.shield(upstream_response.aclose())
                             except Exception:
@@ -2582,7 +2630,7 @@ def create_gateway_router(
                         if chunk:
                             yield chunk
                 except Exception:
-                    if not _disconnected:
+                    if not client_disconnected:
                         raise
                 finally:
                     if next_chunk_task is not None:
@@ -2603,11 +2651,10 @@ def create_gateway_router(
                     except (asyncio.CancelledError, Exception):
                         pass
                     await release_resources()
-                    if _disconnected:
-                        session_manager.invalidate_token(user_key, conversation_id)
 
-            return StreamingResponse(
+            return _OwnedStreamingResponse(
                 event_stream(),
+                release=release_resources,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2621,15 +2668,17 @@ def create_gateway_router(
         except Exception as exc:
             await release_resources()
             raise HTTPException(status_code=502, detail="Gateway proxy error") from exc
+        except BaseException:
+            await release_resources()
+            raise
 
     @router.post("/chat/cancel")
     async def gateway_chat_cancel(
         cancel_request: GatewayChatCancelRequest,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ) -> Response:
         """Cancel the active upstream gateway chat turn for the cached session."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         raw_conversation_id = cancel_request.conversation_id
         conversation_id = None
@@ -2675,11 +2724,10 @@ def create_gateway_router(
     @router.get("/chat/subscribe")
     async def gateway_chat_subscribe(
         request: Request,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ):
         """Attach to an active upstream gateway chat turn for the cached conversation."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         conversation_id = _query_conversation_id(request)
         session_token = session_manager.lookup_token(user_key, conversation_id)
@@ -2701,6 +2749,9 @@ def create_gateway_router(
 
         client = _create_http_client()
         upstream_response: Optional[httpx.Response] = None
+        # An attached view keeps the conversation's session state out of eviction
+        # exactly as the turn's own POST stream does.
+        session_manager.begin_stream(user_key, conversation_id)
         closed = False
 
         async def release_resources() -> None:
@@ -2708,9 +2759,12 @@ def create_gateway_router(
             if closed:
                 return
             closed = True
-            if upstream_response is not None:
-                await upstream_response.aclose()
-            await client.aclose()
+            try:
+                if upstream_response is not None:
+                    await upstream_response.aclose()
+                await client.aclose()
+            finally:
+                session_manager.end_stream(user_key, conversation_id)
 
         try:
             params = {
@@ -2808,8 +2862,9 @@ def create_gateway_router(
                         pass
                     await release_resources()
 
-            return StreamingResponse(
+            return _OwnedStreamingResponse(
                 event_stream(),
+                release=release_resources,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2823,6 +2878,9 @@ def create_gateway_router(
         except Exception as exc:
             await release_resources()
             raise HTTPException(status_code=502, detail="Gateway subscribe proxy error") from exc
+        except BaseException:
+            await release_resources()
+            raise
 
     @router.post("/tool-approval")
     async def gateway_tool_approval(
@@ -2898,11 +2956,10 @@ def create_gateway_router(
     async def gateway_control_proxy(
         path: str,
         request: Request,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ):
         """Proxy browser-safe control-plane requests to the gateway."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         user_email = _user_email(user)
         normalized_path, segments = _validate_control_path(path, request.method)
@@ -2947,11 +3004,10 @@ def create_gateway_router(
     async def gateway_artifact_detail_proxy(
         path: str,
         request: Request,
-        user: dict[str, Any] = Depends(get_current_user),
+        user: dict[str, Any] = Depends(get_paid_user),
     ):
         """Proxy typed artifact sidecar reads to the gateway artifact API."""
 
-        _require_min_chat_tier(user, config)
         user_key = _get_user_key(user)
         user_email = _user_email(user)
         normalized_path, segments = _validate_artifact_detail_path(path, request.method)

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
+import os
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 from uuid import uuid4
 
@@ -30,6 +33,8 @@ _INIT_PASSTHROUGH_ERRORS = frozenset(
 _CHAT_INIT_PATH = "/api/chat/init"
 _CONTROL_INIT_PATH = "/api/control/session"
 _MAX_SESSION_STATE_ENTRIES = 256
+
+logger = logging.getLogger(__name__)
 
 
 def _consumer_key_hash(api_key: str) -> str:
@@ -66,8 +71,17 @@ class InMemoryTokenStore:
         self._data.clear()
 
 
+@dataclass
+class _ChatIdentity:
+    """The warm conversation and the log actually targeted by its cached bearer."""
+
+    log_session_id: str | None = None
+    bearer_log_session_id: str | None = None
+    opening_session_ids: set[str] = field(default_factory=set)
+
+
 class GatewaySessionManager:
-    """Manage per-user gateway tokens and chat stream locks."""
+    """Manage per-user gateway tokens and active chat stream accounting."""
 
     def __init__(
         self,
@@ -87,10 +101,13 @@ class GatewaySessionManager:
         )
         self._consumer_hashes: dict[str, str] = {}
         self._session_ids: dict[str, str] = {}
+        self._chat_identities: dict[str, _ChatIdentity] = {}
         self._token_locks: dict[str, asyncio.Lock] = {}
-        self._stream_locks: dict[str, asyncio.Lock] = {}
+        # Open chat streams per token key; an entry exists only while its count > 0.
+        self._active_streams: dict[str, int] = {}
+        # Open keys one of whose streams was abandoned by its client; cleared at the last end.
+        self._abandoned_streams: set[str] = set()
         self._token_recency: OrderedDict[str, None] = OrderedDict()
-        self._stream_lock_recency: OrderedDict[str, None] = OrderedDict()
         self._state_lock = asyncio.Lock()
         # Eligibility is principal/session scoped; never share choices across users.
         self._capability_choices: dict[str, dict[str, Any]] = {}
@@ -145,28 +162,83 @@ class GatewaySessionManager:
                 if not needs_refresh or current_token != cached_token_before_lock:
                     return current_token
 
-            token, session_id, capability_choices = await self._initialize_session_state(
-                client=client,
-                api_key=api_key,
-                gateway_url=gateway_url_fn(),
-                user_id=user_key,
-                channel=channel,
-                user_email=user_email,
-                init_path=_CHAT_INIT_PATH,
-            )
-            self._token_store.set(token_key, token)
-            if session_id:
-                self._session_ids[token_key] = session_id
-            else:
-                self._session_ids.pop(token_key, None)
-            if capability_choices is not None:
-                self._capability_choices[token_key] = capability_choices
-            else:
-                self._capability_choices.pop(token_key, None)
-            self._consumer_hashes[token_key] = consumer_hash
-            self._touch_token_key(token_key)
-            self._evict_idle_token_state(protected_key=token_key)
-            return token
+            while True:
+                identity = self._chat_identities.setdefault(token_key, _ChatIdentity())
+                resume_session_id = identity.log_session_id
+                try:
+                    token, session_id, capability_choices, resumed_from_session_id = (
+                        await self._initialize_session_state(
+                            client=client,
+                            api_key=api_key,
+                            gateway_url=gateway_url_fn(),
+                            user_id=user_key,
+                            channel=channel,
+                            user_email=user_email,
+                            init_path=_CHAT_INIT_PATH,
+                            resume_session_id=resume_session_id,
+                        )
+                    )
+                except HTTPException as exc:
+                    if exc.status_code != 409 or not resume_session_id:
+                        raise
+                    if self._chat_identities.get(token_key) is not identity:
+                        break
+                    logger.warning(
+                        "gateway chat continuity lost user_id=%s conversation_id=%s "
+                        "log_session_id=%s reason=%s",
+                        user_key,
+                        conversation_id,
+                        resume_session_id,
+                        exc.detail.get("reason") if isinstance(exc.detail, dict) else exc.detail,
+                    )
+                    identity = _ChatIdentity()
+                    self._chat_identities[token_key] = identity
+                    self.invalidate_token(user_key, conversation_id)
+                    resume_session_id = None
+                    token, session_id, capability_choices, resumed_from_session_id = (
+                        await self._initialize_session_state(
+                            client=client,
+                            api_key=api_key,
+                            gateway_url=gateway_url_fn(),
+                            user_id=user_key,
+                            channel=channel,
+                            user_email=user_email,
+                            init_path=_CHAT_INIT_PATH,
+                        )
+                    )
+                if self._chat_identities.get(token_key) is not identity:
+                    break
+                # A pending first POST can establish the log while init awaits HTTP.
+                # Complete that refresh against the newly established log instead.
+                if identity.log_session_id != resume_session_id:
+                    continue
+                if resumed_from_session_id:
+                    identity.log_session_id = resumed_from_session_id
+                identity.bearer_log_session_id = (
+                    resumed_from_session_id or resume_session_id or session_id
+                )
+                if identity.log_session_id is None and session_id:
+                    identity.opening_session_ids.add(session_id)
+                self._token_store.set(token_key, token)
+                if session_id:
+                    self._session_ids[token_key] = session_id
+                else:
+                    self._session_ids.pop(token_key, None)
+                if capability_choices is not None:
+                    self._capability_choices[token_key] = capability_choices
+                else:
+                    self._capability_choices.pop(token_key, None)
+                self._consumer_hashes[token_key] = consumer_hash
+                self._touch_token_key(token_key)
+                self._evict_idle_token_state(protected_key=token_key)
+                return token
+
+        # Reset retired the identity and its lock while HTTP was pending. Resolve
+        # through the current owner, never install the retired init's bearer.
+        return await self.get_token(
+            user_key, client, api_key_fn, gateway_url_fn,
+            conversation_id=conversation_id, channel=channel, user_email=user_email,
+        )
 
     def get_cached_capability_choices(
         self,
@@ -242,7 +314,7 @@ class GatewaySessionManager:
                 if not needs_refresh or current_token != cached_token_before_lock:
                     return current_token
 
-            token, session_id, _capability_choices = await self._initialize_session_state(
+            token, session_id, _capability_choices, _resumed_from_session_id = await self._initialize_session_state(
                 client=client,
                 api_key=api_key,
                 gateway_url=gateway_url_fn(),
@@ -273,33 +345,82 @@ class GatewaySessionManager:
             self._evict_idle_token_state(protected_key=token_key)
             return lock
 
-    async def get_stream_lock(
-        self, user_key: str, conversation_id: str | None = None
-    ) -> asyncio.Lock:
-        """Return the per-user or per-conversation chat stream lock."""
+    def begin_stream(self, user_key: str, conversation_id: str | None = None) -> None:
+        """Count an open chat stream; its token/identity state is not evictable.
 
-        async with self._state_lock:
-            lock_key = self._token_key(user_key, conversation_id)
-            self._touch_stream_lock_key(lock_key)
-            lock = self._stream_locks.get(lock_key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._stream_locks[lock_key] = lock
-            self._evict_idle_stream_locks(protected_key=lock_key)
-            return lock
+        Streams are not exclusive: concurrent turns on one conversation are
+        admitted or refused by the gateway. Pair every call with ``end_stream``.
+        """
+
+        stream_key = self._token_key(user_key, conversation_id)
+        self._active_streams[stream_key] = self._active_streams.get(stream_key, 0) + 1
+
+    def end_stream(
+        self,
+        user_key: str,
+        conversation_id: str | None = None,
+        *,
+        abandoned: bool = False,
+    ) -> None:
+        """Release one ``begin_stream``; the entry is dropped when none remain open.
+
+        An abandoned stream (its client disconnected) drops the bearer only when
+        no other view is attached: the invalidation waits for the last stream on
+        the key to end, so a still-attached subscriber keeps its token and session id.
+        """
+
+        stream_key = self._token_key(user_key, conversation_id)
+        remaining = self._active_streams.pop(stream_key, 0) - 1
+        if remaining > 0:
+            self._active_streams[stream_key] = remaining
+            if abandoned:
+                self._abandoned_streams.add(stream_key)
+            return
+        if stream_key in self._abandoned_streams:
+            self._abandoned_streams.discard(stream_key)
+            abandoned = True
+        if abandoned:
+            self.invalidate_token(user_key, conversation_id)
 
     def invalidate_token(self, user_key: str, conversation_id: str | None = None) -> None:
-        """Drop any cached gateway session token for the user or conversation."""
+        """Drop the bearer/session state, preserving the warm conversation log."""
 
         token_key = self._token_key(user_key, conversation_id)
         self._token_store.delete(token_key)
         self._consumer_hashes.pop(token_key, None)
         self._session_ids.pop(token_key, None)
         self._capability_choices.pop(token_key, None)
-        self._token_recency.pop(token_key, None)
+        self._touch_token_key(token_key)
         token_lock = self._token_locks.get(token_key)
         if token_lock is None or not token_lock.locked():
             self._token_locks.pop(token_key, None)
+        self._evict_idle_token_state(protected_key=token_key)
+
+    def mark_chat_accepted(
+        self,
+        user_key: str,
+        *,
+        session_id: str | None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Establish the opening log and keep its bearer pairing coherent.
+
+        Only inits belonging to the current warm conversation can open its log.
+        Reset/eviction retires those ids; token invalidation does not.
+        """
+
+        token_key = self._token_key(user_key, conversation_id)
+        identity = self._chat_identities.get(token_key)
+        if identity is None or identity.log_session_id is not None:
+            return
+        if session_id not in identity.opening_session_ids:
+            return
+        identity.log_session_id = session_id
+        identity.opening_session_ids.clear()
+        if identity.bearer_log_session_id != session_id:
+            self.invalidate_token(user_key, conversation_id)
+        self._touch_token_key(token_key)
+        self._evict_idle_token_state(protected_key=token_key)
 
     def invalidate_control_token(self, user_key: str) -> None:
         """Drop any cached gateway control-plane token for the user."""
@@ -339,23 +460,18 @@ class GatewaySessionManager:
         self._token_store.clear()
         self._consumer_hashes.clear()
         self._session_ids.clear()
+        self._chat_identities.clear()
         self._capability_choices.clear()
         self._token_locks.clear()
-        self._stream_locks.clear()
+        self._active_streams.clear()
+        self._abandoned_streams.clear()
         self._token_recency.clear()
-        self._stream_lock_recency.clear()
 
     def _touch_token_key(self, token_key: str) -> None:
         """Mark token state as recently used for bounded idle eviction."""
 
         self._token_recency[token_key] = None
         self._token_recency.move_to_end(token_key)
-
-    def _touch_stream_lock_key(self, lock_key: str) -> None:
-        """Mark stream-lock state as recently used for bounded idle eviction."""
-
-        self._stream_lock_recency[lock_key] = None
-        self._stream_lock_recency.move_to_end(lock_key)
 
     def _evict_idle_token_state(self, *, protected_key: str | None = None) -> None:
         """Reclaim least-recently-used idle token state over the configured cap."""
@@ -368,35 +484,16 @@ class GatewaySessionManager:
                 token_lock = self._token_locks.get(token_key)
                 if token_lock is not None and token_lock.locked():
                     continue
-                stream_lock = self._stream_locks.get(token_key)
-                if stream_lock is not None and stream_lock.locked():
+                if token_key in self._active_streams:
                     continue
 
                 self._token_recency.pop(token_key, None)
                 self._token_store.delete(token_key)
                 self._consumer_hashes.pop(token_key, None)
                 self._session_ids.pop(token_key, None)
+                self._chat_identities.pop(token_key, None)
                 self._capability_choices.pop(token_key, None)
                 self._token_locks.pop(token_key, None)
-                evicted = True
-                break
-            if not evicted:
-                return
-
-    def _evict_idle_stream_locks(self, *, protected_key: str | None = None) -> None:
-        """Reclaim least-recently-used stream locks without dropping held locks."""
-
-        while len(self._stream_lock_recency) > self._max_session_state_entries:
-            evicted = False
-            for lock_key in list(self._stream_lock_recency):
-                if lock_key == protected_key:
-                    continue
-                lock = self._stream_locks.get(lock_key)
-                if lock is not None and lock.locked():
-                    continue
-
-                self._stream_lock_recency.pop(lock_key, None)
-                self._stream_locks.pop(lock_key, None)
                 evicted = True
                 break
             if not evicted:
@@ -414,7 +511,7 @@ class GatewaySessionManager:
     ) -> str:
         """Create a new gateway session token via API key auth."""
 
-        token, _session_id, _capability_choices = await self._initialize_session_state(
+        token, _session_id, _capability_choices, _resumed_from_session_id = await self._initialize_session_state(
             client=client,
             api_key=api_key,
             gateway_url=gateway_url,
@@ -434,7 +531,8 @@ class GatewaySessionManager:
         channel: str | None = None,
         user_email: str | None = None,
         init_path: str = _CHAT_INIT_PATH,
-    ) -> tuple[str, str | None, dict[str, Any] | None]:
+        resume_session_id: str | None = None,
+    ) -> tuple[str, str | None, dict[str, Any] | None, str | None]:
         """Create a new gateway session and retain its scoped eligible choices."""
 
         init_payload = {"api_key": api_key}
@@ -444,6 +542,8 @@ class GatewaySessionManager:
             init_payload["user_email"] = user_email
         if channel:
             init_payload["context"] = {"channel": str(channel)}
+        if resume_session_id:
+            init_payload["resume_session_id"] = resume_session_id
         if str(channel or "").strip().lower() == "web" and self._subject_assertion_issuer:
             request_id = str(uuid4())
             init_payload["request_id"] = request_id
@@ -458,11 +558,16 @@ class GatewaySessionManager:
             # Bounded explicitly: the shared client disables the read timeout for
             # SSE streaming. This init POST runs while holding the per-user token
             # lock — an unbounded wait here silently parks every subsequent chat
-            # send for the user (Lane H LH-13).
+            # send for the user (Lane H LH-13). Cold placement of per-user runtimes
+            # (image pull + S3 desk restore on AgentCore, ~25-30s local) requires
+            # a read timeout accommodating placement completion on turn 1.
+            init_read_timeout = float(
+                os.getenv("GATEWAY_SESSION_INIT_TIMEOUT_SECONDS", "120.0")
+            )
             response = await client.post(
                 f"{gateway_url}{init_path}",
                 json=init_payload,
-                timeout=httpx.Timeout(10.0, read=20.0),
+                timeout=httpx.Timeout(10.0, read=init_read_timeout),
             )
         except httpx.TimeoutException as exc:
             raise HTTPException(
@@ -477,6 +582,13 @@ class GatewaySessionManager:
                 error_body = response.json()
             except ValueError:
                 error_body = None
+            if (
+                resume_session_id
+                and response.status_code == 409
+                and isinstance(error_body, dict)
+                and error_body.get("error") == "session_resume_refused"
+            ):
+                raise HTTPException(status_code=409, detail=error_body)
             if (
                 isinstance(error_body, dict)
                 and error_body.get("error") in _INIT_PASSTHROUGH_ERRORS
@@ -505,7 +617,12 @@ class GatewaySessionManager:
         capability_choices = None
         if init_path == _CHAT_INIT_PATH and isinstance(payload, dict):
             capability_choices = self._extract_capability_choices(payload)
-        return token, session_id, capability_choices
+        resumed_from_session_id = None
+        if init_path == _CHAT_INIT_PATH and isinstance(payload, dict):
+            resumed = payload.get("resumed_from_session_id")
+            if resumed:
+                resumed_from_session_id = str(resumed)
+        return token, session_id, capability_choices, resumed_from_session_id
 
     def _extract_session_token(self, payload: dict[str, Any]) -> Optional[str]:
         """Extract a session token from the init payload."""

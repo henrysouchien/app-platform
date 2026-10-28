@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 APP_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 JSON_LOG_FORMAT = "%(message)s"
@@ -22,6 +22,24 @@ VERY_SLOW_OPERATION_THRESHOLD = 5.0
 DEDUP_WINDOW_S = 300
 MAX_DEDUP_KEYS = 500
 _THIRD_PARTY_DEBUG_CLAMP = ("botocore", "boto3", "urllib3", "s3transfer")
+
+
+def resolve_log_dir(app_name: str, log_dir: str | None = None) -> str:
+    """Resolve writable log state independently of the application code tree."""
+    configured = log_dir or os.getenv("LOG_DIR")
+    if configured:
+        return str(Path(configured).expanduser())
+    state_root = Path(os.getenv("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    return str(state_root.expanduser() / "hank" / app_name / "logs")
+
+
+class _LazyLogger(logging.LoggerAdapter):
+    """Keep logger acquisition import-safe, including the first level check."""
+
+    def isEnabledFor(self, level: int) -> bool:
+        manager = get_logging_manager()
+        assert manager is not None
+        return self.logger.isEnabledFor(level)
 
 
 def _json_default(value: Any) -> Any:
@@ -178,6 +196,7 @@ class LoggingManager:
     """Configures process logging and exposes structured event helpers."""
 
     _default_manager: "LoggingManager | None" = None
+    _default_options: dict[str, Any] = {}
     _default_lock = threading.Lock()
 
     def __init__(
@@ -197,12 +216,7 @@ class LoggingManager:
         self.app_name = (app_name or "app").strip() or "app"
         self.environment = (environment or os.getenv("ENVIRONMENT", "development")).lower()
         self.is_production = self.environment == "production"
-        if log_dir:
-            resolved_log_dir = log_dir
-        else:
-            resolved_log_dir = os.getenv("LOG_DIR") or os.path.join(os.getcwd(), "logs")
-        self.log_dir = str(Path(resolved_log_dir))
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        self.log_dir = resolve_log_dir(self.app_name, log_dir)
 
         self.enable_debug_log = (
             not self.is_production if enable_debug_log is None else bool(enable_debug_log)
@@ -271,6 +285,7 @@ class LoggingManager:
             logging.getLogger(logger_name).setLevel(logging.INFO)
 
         if not _has_file_handler(root_logger, self.app_log_path):
+            Path(self.log_dir).mkdir(parents=True, exist_ok=True)
             app_handler = RotatingFileHandler(
                 self.app_log_path,
                 maxBytes=10 * 1024 * 1024,
@@ -542,12 +557,16 @@ class LoggingManager:
         )
 
     @classmethod
-    def _configure_default(cls, **kwargs: Any) -> "LoggingManager":
+    def _configure_default(
+        cls, *, defer: bool = False, **kwargs: Any
+    ) -> "LoggingManager | None":
         with cls._default_lock:
             if cls._default_manager is not None:
                 cls._default_manager.close()
                 cls._default_manager = None
-            cls._default_manager = cls(**kwargs)
+            cls._default_options = kwargs
+            if not defer:
+                cls._default_manager = cls(**kwargs)
             return cls._default_manager
 
     @classmethod
@@ -559,11 +578,7 @@ class LoggingManager:
         if cls._default_manager is None and auto_configure:
             with cls._default_lock:
                 if cls._default_manager is None:
-                    cls._default_manager = cls()
-                    cls._default_manager.get_logger("logging").warning(
-                        "LoggingManager auto-configured with defaults because "
-                        "configure_logging() was not called first"
-                    )
+                    cls._default_manager = cls(**cls._default_options)
         return cls._default_manager
 
     @classmethod
@@ -572,11 +587,24 @@ class LoggingManager:
             if cls._default_manager is not None:
                 cls._default_manager.close()
             cls._default_manager = None
+            cls._default_options = {}
 
 
-def configure_logging(**kwargs: Any) -> LoggingManager:
-    """Create and install the process-global default logging manager."""
-    return LoggingManager._configure_default(**kwargs)
+@overload
+def configure_logging(
+    *, defer: Literal[False] = False, **kwargs: Any
+) -> LoggingManager: ...
+
+
+@overload
+def configure_logging(*, defer: Literal[True], **kwargs: Any) -> None: ...
+
+
+def configure_logging(
+    *, defer: bool = False, **kwargs: Any
+) -> LoggingManager | None:
+    """Configure logging now, or defer file handlers until logging is used."""
+    return LoggingManager._configure_default(defer=defer, **kwargs)
 
 
 def get_logging_manager(*, auto_configure: bool = True) -> LoggingManager | None:
@@ -584,11 +612,19 @@ def get_logging_manager(*, auto_configure: bool = True) -> LoggingManager | None
     return LoggingManager._get_default_manager(auto_configure=auto_configure)
 
 
-def get_logger(name: str) -> logging.Logger:
-    """Return a logger from the process-global default manager."""
-    manager = LoggingManager._get_default_manager()
-    assert manager is not None
-    return manager.get_logger(name)
+def get_logger(name: str) -> logging.Logger | logging.LoggerAdapter:
+    """Acquire a logger without opening files or constructing a manager."""
+    manager = LoggingManager._get_default_manager(auto_configure=False)
+    if manager is not None:
+        return manager.get_logger(name)
+    app_name = (LoggingManager._default_options.get("app_name") or "app").strip() or "app"
+    if not name:
+        logger_name = app_name
+    elif name == app_name or name.startswith(f"{app_name}."):
+        logger_name = name
+    else:
+        logger_name = f"{app_name}.{name}"
+    return _LazyLogger(logging.getLogger(logger_name), {})
 
 
 def set_log_context(**fields: Any) -> None:

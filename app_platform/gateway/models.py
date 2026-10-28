@@ -232,8 +232,35 @@ class GatewayToolApprovalRequest(BaseModel):
     conversation_id: Optional[str] = None
 
 
+class GatewayCapabilityRateTier(BaseModel):
+    """Whole-request prices at or above a prompt-size threshold."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    min_input_tokens: int
+    input_cost_per_mtok: float
+    output_cost_per_mtok: float
+    cache_read_cost_per_mtok: float
+    cache_write_cost_per_mtok: float
+
+
+class GatewayCapabilityRates(BaseModel):
+    """Per-million-token prices from the model authority's rate files."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_cost_per_mtok: float
+    output_cost_per_mtok: float
+    cache_read_cost_per_mtok: float
+    cache_write_cost_per_mtok: float
+    tiers: list[GatewayCapabilityRateTier]
+
+
 class GatewayCapabilityChoice(BaseModel):
-    """One authenticated, session-eligible stable model choice."""
+    """One authenticated, session-eligible stable model choice.
+
+    ``rates`` is ``"unknown"`` when the authority does not price the model.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -242,6 +269,23 @@ class GatewayCapabilityChoice(BaseModel):
     supported_efforts: list[str]
     default_effort: str
     lifecycle: str
+    # Defaulted: the Risk API can face a gateway older than its rate projection.
+    rates: GatewayCapabilityRates | Literal["unknown"] = "unknown"
+
+
+class GatewayCapabilityRoleChoice(BaseModel):
+    """What one model role binds to for this capability, at what price, or why not."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    role: str
+    model_key: str | None
+    label: str | None
+    route: str | None
+    effort: str | None
+    rates: GatewayCapabilityRates | Literal["unknown"]
+    unavailable: str | None = None
+    detail: str | None = None
 
 
 class GatewayCapabilityChoiceSelection(BaseModel):
@@ -259,6 +303,7 @@ class GatewayCapabilityChoiceNotice(BaseModel):
     code: str
     message: str
     model_key: str | None = None
+    reason: str | None = None
 
 
 class GatewayCapabilityChoicesResponse(BaseModel):
@@ -272,6 +317,8 @@ class GatewayCapabilityChoicesResponse(BaseModel):
     selected: GatewayCapabilityChoiceSelection | None
     notices: list[GatewayCapabilityChoiceNotice]
     choices: list[GatewayCapabilityChoice]
+    # Defaulted: an older gateway sends no role rows.
+    roles: list[GatewayCapabilityRoleChoice] = []
 
 
 class GatewayModelPreferenceUpdate(BaseModel):
@@ -306,6 +353,25 @@ class GatewayModelPreferenceResponse(BaseModel):
     effort: str | None
 
 
+class GatewayModelPresetUpdate(BaseModel):
+    """Named policy preset forwarded to the gateway, which owns which names exist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+
+
+class GatewayModelPresetResponse(BaseModel):
+    """The user's selected preset and every name the gateway's preset door accepts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str | None
+    policy_revision: str | None
+    updated_at: int | None
+    known_preset_names: list[str]
+
+
 class GatewayCapabilitiesResponse(BaseModel):
     """Browser-safe gateway capability projection."""
 
@@ -330,6 +396,8 @@ __all__ = [
     "GatewayChatRequest",
     "GatewayModelPreferenceResponse",
     "GatewayModelPreferenceUpdate",
+    "GatewayModelPresetResponse",
+    "GatewayModelPresetUpdate",
     "GatewayToolApprovalRequest",
     "GatewayUiBlocksContract",
 ]
